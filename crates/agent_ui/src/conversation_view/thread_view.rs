@@ -788,6 +788,8 @@ pub struct ThreadView {
     pub current_submission: Option<SubmissionId>,
     revealed_unsettled_submissions: HashSet<SubmissionId>,
     submission_reveal_tasks: HashMap<SubmissionId, Task<()>>,
+    remote_submission: Option<(SubmissionId, String, usize)>,
+    remote_submissions: std::collections::VecDeque<(SubmissionId, String, usize)>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1319,6 +1321,8 @@ impl ThreadView {
             current_submission,
             revealed_unsettled_submissions,
             submission_reveal_tasks: HashMap::default(),
+            remote_submission: None,
+            remote_submissions: std::collections::VecDeque::new(),
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
@@ -1436,6 +1440,88 @@ impl ThreadView {
         }
     }
 
+    pub(crate) fn send_remote_skill(
+        &mut self,
+        skill: crate::completion_provider::AvailableSkill,
+        mut content: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let uri = acp_thread::MentionUri::Skill {
+            name: skill.name.to_string(),
+            source: skill.source.to_string(),
+            skill_file_path: skill.skill_file_path,
+        };
+        let http_client = workspace.read(cx).client().http_client();
+        let mention_set = self.message_editor.read(cx).mention_set().clone();
+        let task = mention_set.update(cx, |set, cx| {
+            set.confirm_mention_for_uri(uri.clone(), false, http_client, cx)
+        });
+        let contents = cx.spawn_in(window, async move |_this, _cx| {
+            let mention = task.await?;
+            let mut tracked_buffers = Vec::new();
+            let block = crate::message_editor::mention_to_content_block(
+                &uri,
+                Some(&mention),
+                true,
+                &mut tracked_buffers,
+            );
+            if let Some(acp_v2::ContentBlock::Text(text)) = content.first_mut() {
+                text.text = format!("{} {}", uri.as_link(), text.text);
+            }
+            content.push(block);
+            Ok(Some((content, tracked_buffers)))
+        });
+        if self.thread.read(cx).status() == ThreadStatus::Idle && !self.has_queued_messages() {
+            self.send_content(contents, false, window, cx);
+        } else {
+            cx.spawn_in(window, async move |this, cx| {
+                let result = contents.await;
+                this.update_in(cx, |this, window, cx| match result {
+                    Ok(Some((content, buffers))) => {
+                        if this.thread.read(cx).status() == ThreadStatus::Idle
+                            && !this.has_queued_messages()
+                        {
+                            this.send_content(
+                                Task::ready(Ok(Some((content, buffers)))),
+                                false,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            this.add_to_queue(content, buffers, window, cx);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.send_content(Task::ready(Err(error)), false, window, cx),
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+        true
+    }
+
+    pub(crate) fn remote_local_commands(&self, cx: &App) -> Vec<PromptLocalCommand> {
+        self.available_local_commands(cx)
+    }
+
+    pub(crate) fn run_remote_local_command(
+        &mut self,
+        command: PromptLocalCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.available_local_commands(cx).contains(&command) {
+            return false;
+        }
+        self.run_local_command(command, window, cx);
+        true
+    }
+
     fn run_local_command(
         &mut self,
         command: PromptLocalCommand,
@@ -1449,6 +1535,19 @@ impl ThreadView {
             }
             PromptLocalCommand::ThumbsDown => {
                 self.handle_feedback_click(ThreadFeedback::Negative, window, cx);
+            }
+            #[cfg(unix)]
+            PromptLocalCommand::RemoteControl => {
+                if self.parent_session_id.is_some() {
+                    return;
+                }
+                match crate::zedlink_probe::toggle_thread_exposure(&self.thread, cx) {
+                    Some(true) => {
+                        self.show_local_command_toast("Thread exposed to ZedLink locally", cx)
+                    }
+                    Some(false) => self.show_local_command_toast("ZedLink exposure stopped", cx),
+                    None => self.show_local_command_toast("ZedLink local probe unavailable", cx),
+                }
             }
         }
     }
@@ -2203,6 +2302,18 @@ impl ThreadView {
             return;
         }
 
+        let draft = self.message_editor.read(cx).text(cx);
+        if let Some(command) = self
+            .available_local_commands(cx)
+            .into_iter()
+            .find(|command| draft.trim() == format!("/{}", command.keyword()))
+        {
+            self.message_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.run_local_command(command, window, cx);
+            return;
+        }
+
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
@@ -2278,6 +2389,10 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    pub(crate) fn is_loading_message_contents(&self) -> bool {
+        self.is_loading_contents
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after
@@ -2392,6 +2507,58 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.send_content_with_remote_origin(contents_task, is_native_command, None, window, cx);
+    }
+
+    pub(crate) fn send_content_from_remote(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        request_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_content_with_remote_origin(
+            contents_task,
+            is_native_command,
+            Some(request_id),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn remote_submission(&self) -> Option<(SubmissionId, &str, usize)> {
+        let (submission_id, request_id, entry_start_index) = self.remote_submission.as_ref()?;
+        (self.current_submission == Some(*submission_id)).then_some((
+            *submission_id,
+            request_id.as_str(),
+            *entry_start_index,
+        ))
+    }
+
+    pub(crate) fn remote_submission_for_request(
+        &self,
+        request_id: &str,
+    ) -> Option<(SubmissionId, usize)> {
+        self.remote_submissions
+            .iter()
+            .rev()
+            .find(|(_, saved_request_id, _)| saved_request_id == request_id)
+            .map(|(submission_id, _, entry_start_index)| (*submission_id, *entry_start_index))
+    }
+
+    fn send_content_with_remote_origin(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        remote_request_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2468,7 +2635,8 @@ impl ThreadView {
             }
 
             let turn_start_time = Instant::now();
-            let send = thread.update(cx, |thread, cx| {
+            let (send, entry_start_index) = thread.update(cx, |thread, cx| {
+                let entry_start_index = thread.entries().len();
                 thread.action_log().update(cx, |action_log, cx| {
                     for buffer in tracked_buffers {
                         action_log.buffer_read(buffer, cx)
@@ -2486,16 +2654,25 @@ impl ThreadView {
                     side = side
                 );
 
-                if is_native_command {
+                let send = if is_native_command {
                     thread.send_command(contents, cx)
                 } else {
                     thread.send(contents, cx)
-                }
+                };
+                (send, entry_start_index)
             })?;
             let submission_id = send.id;
 
             let _ = this.update(cx, |this, cx| {
                 this.current_submission = Some(submission_id);
+                this.remote_submission = remote_request_id.map(|request_id| {
+                    let record = (submission_id, request_id, entry_start_index);
+                    this.remote_submissions.push_back(record.clone());
+                    if this.remote_submissions.len() > 256 {
+                        this.remote_submissions.pop_front();
+                    }
+                    record
+                });
                 this.sync_generating_indicator(cx);
                 cx.notify();
             });
@@ -2614,6 +2791,137 @@ impl ThreadView {
         self.emit_thread_error_telemetry(&error, cx);
         self.thread_error = Some(error);
         cx.notify();
+    }
+
+    pub(crate) fn zedlink_error_summary(&self) -> Option<(&'static str, String, String, bool)> {
+        self.thread_error.as_ref().map(|error| match error {
+            ThreadError::ZedPaymentRequired => (
+                "payment_required",
+                "Usage limit reached".into(),
+                "Zed reached its configured usage limit.".into(),
+                false,
+            ),
+            ThreadError::DataRetentionConsentRequired => (
+                "data_retention_consent_required",
+                "Model unavailable".into(),
+                "The selected model is unavailable with the current data retention setting."
+                    .into(),
+                false,
+            ),
+            ThreadError::Refusal => (
+                "refusal",
+                "Request refused".into(),
+                "The selected model refused this request.".into(),
+                false,
+            ),
+            ThreadError::AuthenticationRequired(message) => (
+                "authentication_required",
+                "Authentication required".into(),
+                message.to_string(),
+                false,
+            ),
+            ThreadError::RateLimitExceeded { provider } => (
+                "rate_limit_exceeded",
+                "Rate limit reached".into(),
+                format!("{provider}'s rate limit was reached. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::ServerOverloaded { provider } => (
+                "server_overloaded",
+                "Provider unavailable".into(),
+                format!("{provider}'s servers are temporarily unavailable. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::PromptTooLarge => (
+                "prompt_too_large",
+                "Context too large".into(),
+                "The request exceeded the model's context window.".into(),
+                false,
+            ),
+            ThreadError::NoCredentials { provider } => (
+                "no_credentials",
+                "Credentials missing".into(),
+                format!("No credentials are configured for {provider}."),
+                false,
+            ),
+            ThreadError::StreamError { provider } => (
+                "stream_error",
+                "Model connection interrupted".into(),
+                format!("The connection to {provider}'s API was interrupted. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::AuthenticationFailed { provider } => (
+                "authentication_failed",
+                "Authentication failed".into(),
+                format!("Zed could not authenticate with {provider}."),
+                false,
+            ),
+            ThreadError::PermissionDenied { provider, message } => (
+                "permission_denied",
+                "Permission denied".into(),
+                message
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{provider} rejected the request.")),
+                false,
+            ),
+            ThreadError::ProviderRejection { message } => (
+                "provider_rejection",
+                "Model request failed".into(),
+                message.to_string(),
+                true,
+            ),
+            ThreadError::MaxOutputTokens => (
+                "max_output_tokens",
+                "Output limit reached".into(),
+                "The model reached its maximum output length.".into(),
+                false,
+            ),
+            ThreadError::NoModelSelected => (
+                "no_model_selected",
+                "No model selected".into(),
+                "Select a model in desktop Zed before sending another message.".into(),
+                false,
+            ),
+            ThreadError::ApiError { provider } => (
+                "api_error",
+                "Model API error".into(),
+                format!("{provider}'s API returned an unexpected error."),
+                true,
+            ),
+            ThreadError::Other { message, .. } => {
+                let normalized = message.to_lowercase();
+                if normalized.contains("image input") && normalized.contains("vision") {
+                    (
+                        "unsupported_image_input",
+                        "Image input unavailable".into(),
+                        message.to_string(),
+                        false,
+                    )
+                } else {
+                    (
+                        "other",
+                        "Agent request failed".into(),
+                        message.to_string(),
+                        false,
+                    )
+                }
+            }
+        })
+    }
+
+    pub(crate) fn zedlink_retry_status(&self) -> Option<(String, usize, usize, u64)> {
+        self.thread_retry_status.as_ref().map(|status| {
+            let remaining = status
+                .duration
+                .saturating_sub(Instant::now().saturating_duration_since(status.started_at));
+            (
+                status.last_error.to_string(),
+                status.attempt,
+                status.max_attempts,
+                remaining.as_millis().try_into().unwrap_or(u64::MAX),
+            )
+        })
     }
 
     fn emit_thread_error_telemetry(&self, error: &ThreadError, cx: &mut Context<Self>) {
@@ -2921,6 +3229,29 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.add_to_queue_with_remote_origin(content, tracked_buffers, None, window, cx);
+    }
+
+    pub(crate) fn add_to_queue_from_remote(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        request_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        self.add_to_queue_with_remote_origin(content, tracked_buffers, Some(request_id), window, cx)
+            .as_usize()
+    }
+
+    fn add_to_queue_with_remote_origin(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        remote_request_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> QueueEntryId {
         // The ID must be allocated up front so the editor event subscription
         // can capture it before the entry (which owns the subscription) exists.
         let id = self.message_queue.next_id();
@@ -2954,12 +3285,14 @@ impl ThreadView {
             id,
             content,
             tracked_buffers,
+            remote_request_id,
             steer: false,
             editor,
             _subscription: subscription,
         });
         self.sync_queue_flag_to_native_thread(cx);
         cx.notify();
+        id
     }
 
     fn handle_queue_editor_event(
@@ -3024,6 +3357,7 @@ impl ThreadView {
                     }
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
+                    entry.remote_request_id = None;
                 }
                 cx.notify();
             })?;
@@ -3139,6 +3473,7 @@ impl ThreadView {
 
         self.message_editor.focus_handle(cx).focus(window, cx);
 
+        let remote_request_id = entry.remote_request_id.clone();
         // A queued message can itself be a built-in command (e.g. the user typed
         // `/compact` while a turn was generating). Detect that so we run it as a
         // command turn without echoing it as a user message, matching the
@@ -3181,7 +3516,13 @@ impl ThreadView {
             Ok(Some((entry.content, entry.tracked_buffers)))
         });
 
-        self.send_content(contents_task, is_native_command, window, cx);
+        self.send_content_with_remote_origin(
+            contents_task,
+            is_native_command,
+            remote_request_id,
+            window,
+            cx,
+        );
     }
 
     pub fn move_queued_message_to_main_editor(
@@ -8301,6 +8642,11 @@ impl ThreadView {
         if self.is_thread_feedback_enabled(cx) {
             commands.push(PromptLocalCommand::ThumbsUp);
             commands.push(PromptLocalCommand::ThumbsDown);
+        }
+
+        #[cfg(unix)]
+        if self.parent_session_id.is_none() && crate::zedlink_probe::is_available(cx) {
+            commands.push(PromptLocalCommand::RemoteControl);
         }
 
         commands

@@ -1,13 +1,22 @@
-use gpui::{Action as _, App};
+use gpui::{
+    Action as _, AnyElement, App, Context, PromptButton, PromptLevel, ReadGlobal, ScrollHandle,
+    SharedString, Window, prelude::*,
+};
 use itertools::Itertools as _;
+use serde::Deserialize;
 use settings::{
     AudioInputDeviceName, AudioOutputDeviceName, EditPredictionDataCollectionChoice,
-    LanguageSettingsContent, SemanticTokens, SettingsContent,
+    LanguageSettingsContent, SemanticTokens, SettingsContent, SettingsStore,
+    ZedLinkConnectionProvider,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use strum::{EnumMessage, IntoDiscriminant as _, VariantArray};
 use theme::SystemAppearance;
-use ui::IntoElement;
+use ui::{
+    Button, ButtonSize, ButtonStyle, Color, Divider, IntoElement, Label, LabelSize, TintColor,
+    prelude::*,
+};
+use util::ResultExt as _;
 
 use crate::{
     ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
@@ -23,6 +32,71 @@ const DEFAULT_STRING: String = String::new();
 /// A default empty string reference. Useful in `pick` functions for cases either in dynamic item fields, or when dealing with `settings::Maybe`
 /// to avoid the "NO DEFAULT" case.
 const DEFAULT_EMPTY_STRING: Option<&String> = Some(&DEFAULT_STRING);
+const TAILSCALE_DNS_ADMIN_URL: &str = "https://login.tailscale.com/admin/dns";
+
+#[derive(Clone, Deserialize)]
+struct ZedLinkGatewayStatus {
+    configured: bool,
+    project_root: String,
+    state_dir: String,
+    targets: Vec<ZedLinkTargetStatus>,
+    routes: Vec<ZedLinkRouteStatus>,
+    gateway: ZedLinkGatewayProcessStatus,
+    patched_zed: ZedLinkPatchedZedStatus,
+}
+
+#[derive(Clone, Deserialize)]
+struct ZedLinkTargetStatus {
+    label: String,
+    probe: String,
+    online: bool,
+}
+
+#[derive(Clone, Deserialize)]
+struct ZedLinkRouteStatus {
+    label: String,
+    provider: String,
+    url: String,
+    bind: String,
+    enabled: bool,
+    primary: bool,
+}
+
+#[derive(Clone, Deserialize)]
+struct ZedLinkGatewayProcessStatus {
+    online: bool,
+    built: bool,
+    paired_devices: usize,
+}
+
+#[derive(Clone, Deserialize)]
+struct ZedLinkPatchedZedStatus {
+    built: bool,
+    executable: String,
+    launcher_installed: bool,
+    command_installed: bool,
+}
+
+#[derive(Clone, Default)]
+struct ZedLinkGatewayDashboardState {
+    status: Option<Result<ZedLinkGatewayStatus, String>>,
+    loading: bool,
+    operation: Option<&'static str>,
+    message: Option<(bool, String)>,
+}
+
+static ZEDLINK_GATEWAY_DASHBOARD: OnceLock<Mutex<ZedLinkGatewayDashboardState>> = OnceLock::new();
+
+fn zedlink_gateway_dashboard() -> &'static Mutex<ZedLinkGatewayDashboardState> {
+    ZEDLINK_GATEWAY_DASHBOARD.get_or_init(|| Mutex::new(ZedLinkGatewayDashboardState::default()))
+}
+
+fn zedlink_gateway_dashboard_state() -> MutexGuard<'static, ZedLinkGatewayDashboardState> {
+    match zedlink_gateway_dashboard().lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 const DEFAULT_AUDIO_OUTPUT: AudioOutputDeviceName = AudioOutputDeviceName(None);
 const DEFAULT_EMPTY_AUDIO_OUTPUT: Option<&AudioOutputDeviceName> = Some(&DEFAULT_AUDIO_OUTPUT);
@@ -77,9 +151,1561 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         version_control_page(),
         collaboration_page(),
         ai_page(cx),
+        zedlink_page(),
         network_page(),
         developer_page(cx),
     ]
+}
+
+fn run_zedlink_in_terminal(
+    action: &'static str,
+    label: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let manager_path = SettingsStore::global(cx)
+        .merged_settings()
+        .zedlink
+        .as_ref()
+        .and_then(|settings| settings.manager_path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let manager_path = manager_path
+                    .ok_or_else(|| anyhow::anyhow!("Run ZedLink: Repair setup first."))?;
+                let quoted_path = task::ShellKind::Posix
+                    .try_quote(&manager_path)
+                    .ok_or_else(|| anyhow::anyhow!("The manager path cannot be quoted safely."))?;
+                let workspace_window =
+                    workspace::activate_any_workspace_window(cx).ok_or_else(|| {
+                        anyhow::anyhow!("Open a local Zed workspace to run this ZedLink action.")
+                    })?;
+                let task = workspace_window.update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        anyhow::ensure!(
+                            workspace.project().read(cx).is_local(),
+                            "ZedLink setup must run in a local Zed workspace."
+                        );
+                        Ok(workspace.spawn_in_terminal(
+                            task::SpawnInTerminal {
+                                id: task::TaskId(format!("zedlink-{action}").into()),
+                                label: label.into(),
+                                full_label: label.into(),
+                                command: Some("python3".into()),
+                                args: vec![quoted_path.into_owned(), action.into()],
+                                shell: task::Shell::Program("sh".into()),
+                                use_new_terminal: true,
+                                allow_concurrent_runs: false,
+                                reveal: task::RevealStrategy::Always,
+                                hide: task::HideStrategy::Never,
+                                show_command: false,
+                                show_summary: false,
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        ))
+                    })
+                })??;
+                let status = task
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("Zed's terminal provider is unavailable."))??;
+                anyhow::ensure!(
+                    status.success(),
+                    "ZedLink action needs attention. Check the terminal for details."
+                );
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                cx.prompt(
+                    PromptLevel::Warning,
+                    "ZedLink terminal action unavailable",
+                    Some(&error.to_string()),
+                    &["OK"],
+                )
+                .await
+                .log_err();
+            }
+        })
+        .detach();
+}
+
+fn run_zedlink_manager_action(action: &'static str, window: &mut gpui::Window, cx: &mut App) {
+    let manager_path = SettingsStore::global(cx)
+        .merged_settings()
+        .zedlink
+        .as_ref()
+        .and_then(|settings| settings.manager_path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    let success_message = match action {
+        "check-connection" => "ZedLink connection passed",
+        "start-gateway-detached" => "ZedLink gateway start requested",
+        "restart-gateway-detached" => "ZedLink gateway restart requested",
+        "stop-gateway" => "ZedLink gateway stopped",
+        "status" => "ZedLink status",
+        "diagnose" => "ZedLink diagnostics",
+        "pair-primary" => "ZedLink pairing page created",
+        "install-renewal" => "Automatic certificate renewal enabled",
+        "renewal-status" => "Certificate renewal status",
+        "renew-certificates" => "Certificate renewal check completed",
+        "remove-renewal" => "Automatic certificate renewal disabled",
+        _ => "ZedLink connection updated",
+    };
+    let failure_message = match action {
+        "check-connection" => "ZedLink connection check failed",
+        "status" => "ZedLink status is unavailable",
+        "diagnose" => "ZedLink diagnostics found a problem",
+        "pair-primary" => "ZedLink could not create a pairing page",
+        "install-renewal" => "Automatic certificate renewal could not be enabled",
+        "renewal-status" => "Certificate renewal status is unavailable",
+        "renew-certificates" => "Certificate renewal failed",
+        "remove-renewal" => "Automatic certificate renewal could not be disabled",
+        _ => "ZedLink action failed",
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let (level, message, detail) = match manager_path {
+                Some(manager_path) => match smol::process::Command::new("python3")
+                    .arg(manager_path)
+                    .arg(action)
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => (
+                        PromptLevel::Info,
+                        success_message,
+                        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                    ),
+                    Ok(output) => (
+                        PromptLevel::Warning,
+                        failure_message,
+                        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                    ),
+                    Err(error) => (
+                        PromptLevel::Warning,
+                        "ZedLink manager could not start",
+                        error.to_string(),
+                    ),
+                },
+                None => (
+                    PromptLevel::Warning,
+                    "ZedLink manager is not configured",
+                    "Run ZedLink: Repair setup, then reopen this page.".to_string(),
+                ),
+            };
+            let detail = detail.chars().take(600).collect::<String>();
+            cx.prompt(level, message, Some(&detail), &["OK"]).await.ok();
+            anyhow::Ok(())
+        })
+        .detach();
+}
+
+fn update_zedlink_gateway_dashboard(
+    action: Option<&'static str>,
+    window: &mut Window,
+    cx: &mut Context<crate::SettingsWindow>,
+) {
+    let manager_path = SettingsStore::global(cx)
+        .merged_settings()
+        .zedlink
+        .as_ref()
+        .and_then(|settings| settings.manager_path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+
+    {
+        let mut dashboard = zedlink_gateway_dashboard_state();
+        dashboard.loading = true;
+        dashboard.operation = action;
+        dashboard.message = None;
+        if manager_path.is_none() {
+            dashboard.loading = false;
+            dashboard.status = Some(Err(
+                "Run ZedLink: Repair setup, then reopen this page.".to_string()
+            ));
+        }
+    }
+
+    let Some(manager_path) = manager_path else {
+        cx.notify();
+        return;
+    };
+
+    let settings_window = cx.weak_entity();
+    window
+        .spawn(cx, async move |cx| {
+            let mut action_message = None;
+            if let Some(action) = action {
+                match smol::process::Command::new("python3")
+                    .arg(&manager_path)
+                    .arg(action)
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        let detail = String::from_utf8_lossy(&output.stdout)
+                            .trim()
+                            .chars()
+                            .take(600)
+                            .collect::<String>();
+                        action_message = Some((true, detail));
+                    }
+                    Ok(output) => {
+                        let detail = String::from_utf8_lossy(&output.stderr)
+                            .trim()
+                            .chars()
+                            .take(600)
+                            .collect::<String>();
+                        let mut dashboard = zedlink_gateway_dashboard_state();
+                        dashboard.loading = false;
+                        dashboard.operation = None;
+                        dashboard.message = Some((false, detail));
+                        settings_window.update(cx, |_, cx| cx.notify()).log_err();
+                        return anyhow::Ok(());
+                    }
+                    Err(error) => {
+                        let mut dashboard = zedlink_gateway_dashboard_state();
+                        dashboard.loading = false;
+                        dashboard.operation = None;
+                        dashboard.message = Some((false, error.to_string()));
+                        settings_window.update(cx, |_, cx| cx.notify()).log_err();
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+
+            let status = match smol::process::Command::new("python3")
+                .arg(&manager_path)
+                .arg("status-json")
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    serde_json::from_slice::<ZedLinkGatewayStatus>(&output.stdout)
+                        .map_err(|error| format!("ZedLink returned an invalid status: {error}"))
+                }
+                Ok(output) => Err(String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .chars()
+                    .take(600)
+                    .collect()),
+                Err(error) => Err(error.to_string()),
+            };
+            {
+                let mut dashboard = zedlink_gateway_dashboard_state();
+                dashboard.status = Some(status);
+                dashboard.loading = false;
+                dashboard.operation = None;
+                dashboard.message = action_message;
+            }
+            settings_window.update(cx, |_, cx| cx.notify()).log_err();
+            anyhow::Ok(())
+        })
+        .detach();
+}
+
+fn zedlink_status_row(
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    healthy: Option<bool>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .justify_between()
+                .gap_6()
+                .py_3()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(Label::new(title.into()))
+                        .child(
+                            Label::new(detail.into())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    Label::new(value.into())
+                        .size(LabelSize::Small)
+                        .color(match healthy {
+                            Some(true) => Color::Success,
+                            Some(false) => Color::Error,
+                            None => Color::Muted,
+                        }),
+                ),
+        )
+        .child(Divider::horizontal())
+        .into_any_element()
+}
+
+fn render_zedlink_gateway_page(
+    _settings_window: &crate::SettingsWindow,
+    scroll_handle: &ScrollHandle,
+    window: &mut Window,
+    cx: &mut Context<crate::SettingsWindow>,
+) -> AnyElement {
+    let should_load = {
+        let dashboard = zedlink_gateway_dashboard_state();
+        dashboard.status.is_none() && !dashboard.loading
+    };
+    if should_load {
+        update_zedlink_gateway_dashboard(None, window, cx);
+    }
+    let dashboard = zedlink_gateway_dashboard_state().clone();
+    let gateway_online = dashboard
+        .status
+        .as_ref()
+        .and_then(|status| status.as_ref().ok())
+        .is_some_and(|status| status.gateway.online);
+
+    let controls = h_flex()
+        .flex_wrap()
+        .gap_2()
+        .child(
+            Button::new("zedlink-gateway-refresh", "Refresh")
+                .style(ButtonStyle::Outlined)
+                .size(ButtonSize::Medium)
+                .disabled(dashboard.loading)
+                .on_click(cx.listener(|_, _, window, cx| {
+                    update_zedlink_gateway_dashboard(None, window, cx)
+                })),
+        )
+        .child(
+            Button::new("zedlink-gateway-start", "Start")
+                .style(ButtonStyle::Filled)
+                .size(ButtonSize::Medium)
+                .disabled(dashboard.loading || gateway_online)
+                .on_click(cx.listener(|_, _, window, cx| {
+                    update_zedlink_gateway_dashboard(Some("start-gateway-detached"), window, cx)
+                })),
+        )
+        .child(
+            Button::new("zedlink-gateway-restart", "Restart")
+                .style(ButtonStyle::Outlined)
+                .size(ButtonSize::Medium)
+                .disabled(dashboard.loading || !gateway_online)
+                .on_click(cx.listener(|_, _, window, cx| {
+                    update_zedlink_gateway_dashboard(Some("restart-gateway-detached"), window, cx)
+                })),
+        )
+        .child(
+            Button::new("zedlink-gateway-stop", "Stop")
+                .style(ButtonStyle::Tinted(TintColor::Error))
+                .size(ButtonSize::Medium)
+                .disabled(dashboard.loading || !gateway_online)
+                .on_click(cx.listener(|_, _, window, cx| {
+                    update_zedlink_gateway_dashboard(Some("stop-gateway"), window, cx)
+                })),
+        )
+        .child(
+            Button::new("zedlink-gateway-diagnose", "Run Diagnostics")
+                .style(ButtonStyle::Outlined)
+                .size(ButtonSize::Medium)
+                .disabled(dashboard.loading)
+                .on_click(cx.listener(|_, _, window, cx| {
+                    update_zedlink_gateway_dashboard(Some("diagnose"), window, cx)
+                })),
+        );
+
+    let mut content = v_flex()
+        .id("zedlink-gateway-page")
+        .size_full()
+        .min_w_0()
+        .overflow_y_scroll()
+        .track_scroll(scroll_handle)
+        .px_8()
+        .pt_2p5()
+        .pb_16()
+        .gap_2()
+        .child(Label::new("Gateway Control").size(LabelSize::Large))
+        .child(
+            Label::new("Live state for the local bridge, private gateway, connection route, and paired devices.")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(controls);
+
+    if dashboard.loading {
+        let operation = dashboard.operation.unwrap_or("refresh");
+        content = content.child(
+            Label::new(format!("{}…", operation.replace('-', " ")))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        );
+    }
+    if let Some((successful, message)) =
+        dashboard.message.filter(|(_, message)| !message.is_empty())
+    {
+        content = content.child(
+            Label::new(message)
+                .size(LabelSize::Small)
+                .color(if successful {
+                    Color::Success
+                } else {
+                    Color::Error
+                }),
+        );
+    }
+
+    match dashboard.status {
+        Some(Ok(status)) if status.configured => {
+            let primary_route = status.routes.iter().find(|route| route.primary);
+            content = content
+                .child(Divider::horizontal().my_3())
+                .child(zedlink_status_row(
+                    "Gateway",
+                    if status.gateway.built {
+                        "Gateway binary is built"
+                    } else {
+                        "Gateway binary is missing"
+                    },
+                    if status.gateway.online {
+                        "RUNNING"
+                    } else {
+                        "STOPPED"
+                    },
+                    Some(status.gateway.online),
+                ))
+                .child(zedlink_status_row(
+                    "Native Zed bridge",
+                    status
+                        .targets
+                        .iter()
+                        .map(|target| format!("{} · {}", target.label, target.probe))
+                        .join("\n"),
+                    if status.targets.iter().any(|target| target.online) {
+                        "CONNECTED"
+                    } else {
+                        "UNAVAILABLE"
+                    },
+                    Some(status.targets.iter().any(|target| target.online)),
+                ))
+                .child(zedlink_status_row(
+                    "Active connection",
+                    primary_route
+                        .map(|route| {
+                            format!(
+                                "{} · {} · {} · {}",
+                                route.label, route.provider, route.url, route.bind
+                            )
+                        })
+                        .unwrap_or_else(|| "No primary connection configured".to_string()),
+                    primary_route
+                        .map(|route| if route.enabled { "ENABLED" } else { "DISABLED" })
+                        .unwrap_or("MISSING"),
+                    primary_route.map(|route| route.enabled),
+                ))
+                .child(zedlink_status_row(
+                    "Paired devices",
+                    "Browsers and installed apps authorized by this gateway",
+                    status.gateway.paired_devices.to_string(),
+                    None,
+                ))
+                .child(zedlink_status_row(
+                    "Project",
+                    status.project_root,
+                    "SCOPED",
+                    Some(true),
+                ))
+                .child(zedlink_status_row(
+                    "Patched Zed",
+                    status.patched_zed.executable,
+                    if status.patched_zed.built
+                        && status.patched_zed.launcher_installed
+                        && status.patched_zed.command_installed
+                    {
+                        "READY"
+                    } else {
+                        "INCOMPLETE"
+                    },
+                    Some(
+                        status.patched_zed.built
+                            && status.patched_zed.launcher_installed
+                            && status.patched_zed.command_installed,
+                    ),
+                ))
+                .child(zedlink_status_row(
+                    "Private state",
+                    status.state_dir,
+                    "LOCAL",
+                    None,
+                ));
+        }
+        Some(Ok(_)) => {
+            content = content
+                .child(Divider::horizontal().my_3())
+                .child(Label::new("ZedLink setup is not configured.").color(Color::Warning))
+                .child(
+                    Label::new("Run ZedLink: Set up this project, then refresh this page.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+        }
+        Some(Err(error)) => {
+            content = content
+                .child(Divider::horizontal().my_3())
+                .child(Label::new("Gateway status unavailable").color(Color::Error))
+                .child(Label::new(error).size(LabelSize::Small).color(Color::Muted));
+        }
+        None => {}
+    }
+
+    content.into_any_element()
+}
+
+fn manage_zedlink_devices(window: &mut gpui::Window, cx: &mut App) {
+    let manager_path = SettingsStore::global(cx)
+        .merged_settings()
+        .zedlink
+        .as_ref()
+        .and_then(|settings| settings.manager_path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    let Some(manager_path) = manager_path else {
+        run_zedlink_manager_action("devices", window, cx);
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let output = smol::process::Command::new("python3")
+                .arg(&manager_path)
+                .arg("devices-json")
+                .output()
+                .await;
+            let devices = match output {
+                Ok(output) if output.status.success() => {
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("devices")
+                                .and_then(|devices| devices.as_array())
+                                .cloned()
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|device| {
+                            Some((
+                                device.get("id")?.as_str()?.to_owned(),
+                                device.get("name")?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                }
+                Ok(output) => {
+                    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    cx.prompt(
+                        PromptLevel::Warning,
+                        "Paired devices are unavailable",
+                        Some(&detail),
+                        &["OK"],
+                    )
+                    .await
+                    .ok();
+                    return anyhow::Ok(());
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    cx.prompt(
+                        PromptLevel::Warning,
+                        "ZedLink manager could not start",
+                        Some(&detail),
+                        &["OK"],
+                    )
+                    .await
+                    .ok();
+                    return anyhow::Ok(());
+                }
+            };
+            if devices.is_empty() {
+                cx.prompt(
+                    PromptLevel::Info,
+                    "No paired devices",
+                    Some("Choose Pair New Device on this page to authorize a browser or installed web app."),
+                    &["OK"],
+                )
+                .await
+                .ok();
+                return anyhow::Ok(());
+            }
+            let page_size = 6;
+            let page_count = devices.len().div_ceil(page_size);
+            let mut page = 0;
+            let (device_id, device_name) = loop {
+                let start = page * page_size;
+                let end = (start + page_size).min(devices.len());
+                let mut answers = devices[start..end]
+                    .iter()
+                    .map(|(id, name)| {
+                        let suffix = id.rsplit('-').next().unwrap_or(id.as_str());
+                        PromptButton::new(format!("{name} · {suffix}"))
+                    })
+                    .collect::<Vec<_>>();
+                let previous_index = (page > 0).then(|| {
+                    let index = answers.len();
+                    answers.push(PromptButton::new("Previous page"));
+                    index
+                });
+                let next_index = (page + 1 < page_count).then(|| {
+                    let index = answers.len();
+                    answers.push(PromptButton::new("Next page"));
+                    index
+                });
+                answers.push(PromptButton::cancel("Close"));
+                let title = format!("Authorized devices · page {} of {page_count}", page + 1);
+                let description = format!(
+                    "{} existing device credentials. Select one to review revocation. To connect a new phone, close this list and choose Open Browser QR. The ID suffix distinguishes devices with the same name.",
+                    devices.len()
+                );
+                let Ok(index) = cx.prompt(PromptLevel::Info, &title, Some(&description), &answers).await else {
+                    return anyhow::Ok(());
+                };
+                if Some(index) == previous_index {
+                    page -= 1;
+                    continue;
+                }
+                if Some(index) == next_index {
+                    page += 1;
+                    continue;
+                }
+                let Some(device) = devices[start..end].get(index) else {
+                    return anyhow::Ok(());
+                };
+                break device.clone();
+            };
+            let suffix = device_id.rsplit('-').next().unwrap_or(device_id.as_str());
+            let confirmation = cx.prompt(
+                PromptLevel::Warning,
+                &format!("Revoke {device_name} · {suffix}?"),
+                Some("This browser or installed app must pair again before it can access ZedLink."),
+                &[
+                    PromptButton::ok("Revoke Device"),
+                    PromptButton::cancel("Cancel"),
+                ],
+            );
+            if confirmation.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+            let output = smol::process::Command::new("python3")
+                .arg(manager_path)
+                .arg("revoke-device")
+                .arg(device_id)
+                .output()
+                .await;
+            let (level, message, detail) = match output {
+                Ok(output) if output.status.success() => (
+                    PromptLevel::Info,
+                    "ZedLink device revoked",
+                    String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                ),
+                Ok(output) => (
+                    PromptLevel::Warning,
+                    "ZedLink could not revoke the device",
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ),
+                Err(error) => (
+                    PromptLevel::Warning,
+                    "ZedLink manager could not start",
+                    error.to_string(),
+                ),
+            };
+            cx.prompt(level, message, Some(&detail), &["OK"]).await.ok();
+            anyhow::Ok(())
+        })
+        .detach();
+}
+
+fn zedlink_connection_settings() -> Vec<SettingsPageItem> {
+    fn string_field(
+        title: &'static str,
+        description: &'static str,
+        json_path: &'static str,
+        pick: fn(&SettingsContent) -> Option<&String>,
+        write: fn(&mut SettingsContent, Option<String>, &App),
+        placeholder: &'static str,
+    ) -> SettingItem {
+        SettingItem {
+            title,
+            description,
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some(json_path),
+                pick,
+                write,
+            }),
+            metadata: Some(Box::new(SettingsFieldMetadata {
+                placeholder: Some(placeholder),
+                ..Default::default()
+            })),
+            files: USER,
+        }
+    }
+
+    fn string_setting(
+        title: &'static str,
+        description: &'static str,
+        json_path: &'static str,
+        pick: fn(&SettingsContent) -> Option<&String>,
+        write: fn(&mut SettingsContent, Option<String>, &App),
+        placeholder: &'static str,
+    ) -> SettingsPageItem {
+        SettingsPageItem::SettingItem(string_field(
+            title,
+            description,
+            json_path,
+            pick,
+            write,
+            placeholder,
+        ))
+    }
+
+    fn direct_connection_fields(
+        listener_description: &'static str,
+        origin_description: &'static str,
+    ) -> Vec<SettingItem> {
+        vec![
+            string_field(
+                "Private Listener",
+                listener_description,
+                "zedlink.connection_bind",
+                |settings_content| settings_content.zedlink.as_ref()?.connection_bind.as_ref(),
+                |settings_content, value, _| {
+                    settings_content
+                        .zedlink
+                        .get_or_insert_default()
+                        .connection_bind = value
+                },
+                "100.64.10.20:44679",
+            ),
+            string_field(
+                "Client HTTPS Origin",
+                origin_description,
+                "zedlink.connection_url",
+                |settings_content| settings_content.zedlink.as_ref()?.connection_url.as_ref(),
+                |settings_content, value, _| {
+                    settings_content
+                        .zedlink
+                        .get_or_insert_default()
+                        .connection_url = value
+                },
+                "https://computer.example.net:44679",
+            ),
+            string_field(
+                "TLS Certificate",
+                "Absolute path to the certificate served by ZedLink. Its hostname must match the client HTTPS origin.",
+                "zedlink.connection_tls_certificate",
+                |settings_content| {
+                    settings_content
+                        .zedlink
+                        .as_ref()?
+                        .connection_tls_certificate
+                        .as_ref()
+                },
+                |settings_content, value, _| {
+                    settings_content
+                        .zedlink
+                        .get_or_insert_default()
+                        .connection_tls_certificate = value
+                },
+                "/home/you/.config/zedlink/tls/computer.crt",
+            ),
+            string_field(
+                "TLS Private Key",
+                "Absolute path to the matching private key. ZedLink requires mode 0600 or stricter.",
+                "zedlink.connection_tls_private_key",
+                |settings_content| {
+                    settings_content
+                        .zedlink
+                        .as_ref()?
+                        .connection_tls_private_key
+                        .as_ref()
+                },
+                |settings_content, value, _| {
+                    settings_content
+                        .zedlink
+                        .get_or_insert_default()
+                        .connection_tls_private_key = value
+                },
+                "/home/you/.config/zedlink/tls/computer.key",
+            ),
+        ]
+    }
+
+    fn proxy_connection_fields(public_origin_description: &'static str) -> Vec<SettingItem> {
+        let mut fields = direct_connection_fields(
+            "Loopback listener used only by the local proxy or reverse tunnel. Keep this on 127.0.0.1.",
+            public_origin_description,
+        );
+        fields.push(string_field(
+            "Origin TLS Name",
+            "Hostname covered by the local certificate between the proxy or tunnel frontend and ZedLink. This is required for proxy profiles.",
+            "zedlink.connection_origin_tls_name",
+            |settings_content| {
+                settings_content
+                    .zedlink
+                    .as_ref()?
+                    .connection_origin_tls_name
+                    .as_ref()
+            },
+            |settings_content, value, _| {
+                settings_content
+                    .zedlink
+                    .get_or_insert_default()
+                    .connection_origin_tls_name = value
+            },
+            "computer.example.net",
+        ));
+        fields
+    }
+
+    vec![
+        SettingsPageItem::SectionHeader("Connection Profile"),
+        string_setting(
+            "Profile ID",
+            "Enter an existing profile ID and choose Select Existing, or enter a new lowercase ID before saving.",
+            "zedlink.connection_id",
+            |settings_content| settings_content.zedlink.as_ref()?.connection_id.as_ref(),
+            |settings_content, value, _| settings_content.zedlink.get_or_insert_default().connection_id = value,
+            "tailscale",
+        ),
+        SettingsPageItem::ActionLink(ActionLink {
+            title: "Select Existing Connection".into(),
+            description: Some("Make the profile ID above primary and load its provider, address, URL, and TLS paths into this page.".into()),
+            button_text: "Select".into(),
+            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("select-connection", window, cx)),
+            files: USER,
+        }),
+        string_setting(
+            "Display Name",
+            "Human-readable name shown in connection diagnostics.",
+            "zedlink.connection_label",
+            |settings_content| settings_content.zedlink.as_ref()?.connection_label.as_ref(),
+            |settings_content, value, _| settings_content.zedlink.get_or_insert_default().connection_label = value,
+            "Tailscale",
+        ),
+        SettingsPageItem::DynamicItem(DynamicItem {
+            discriminant: SettingItem {
+                title: "Connection Provider",
+                description: "The dropdown shows the provider used by this profile. Changing it immediately shows the configuration required by that provider; choose Save & Activate to apply it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.connection_provider"),
+                    pick: |settings_content| {
+                        settings_content.zedlink.as_ref()?.connection_provider.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .connection_provider = value
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    should_do_titlecase: Some(false),
+                    ..Default::default()
+                })),
+                files: USER,
+            },
+            pick_discriminant: |settings_content| {
+                Some(match settings_content.zedlink.as_ref()?.connection_provider.as_ref()? {
+                    ZedLinkConnectionProvider::Tailscale => 0,
+                    ZedLinkConnectionProvider::NetBird => 1,
+                    ZedLinkConnectionProvider::WireGuard => 2,
+                    ZedLinkConnectionProvider::ZeroTier => 3,
+                    ZedLinkConnectionProvider::Twingate => 4,
+                    ZedLinkConnectionProvider::Headscale => 5,
+                    ZedLinkConnectionProvider::Cloudflare => 6,
+                    ZedLinkConnectionProvider::SshReverse => 7,
+                    ZedLinkConnectionProvider::SshLocal => 8,
+                    ZedLinkConnectionProvider::Lan => 9,
+                    ZedLinkConnectionProvider::Custom => 10,
+                })
+            },
+            fields: vec![
+                direct_connection_fields(
+                    "Tailscale IP and port used by the gateway. Detect Provider Defaults can fill the current tailnet address.",
+                    "Trusted Tailscale HTTPS URL opened by clients, normally the MagicDNS hostname and gateway port.",
+                ),
+                direct_connection_fields(
+                    "NetBird private IP and port used by the gateway. Detect Provider Defaults can fill the current NetBird address.",
+                    "Trusted HTTPS URL that NetBird peers use to reach this workstation.",
+                ),
+                direct_connection_fields(
+                    "WireGuard interface IP and port used by the gateway. Configure the WireGuard peer and routes outside ZedLink.",
+                    "Trusted HTTPS URL routed through the WireGuard network.",
+                ),
+                direct_connection_fields(
+                    "ZeroTier managed private IP and port used by the gateway.",
+                    "Trusted HTTPS URL reachable by authorized members of the ZeroTier network.",
+                ),
+                direct_connection_fields(
+                    "Private resource address and port reachable through the Twingate connector.",
+                    "Trusted HTTPS resource URL configured for Twingate clients.",
+                ),
+                direct_connection_fields(
+                    "Headscale-managed Tailscale IP and port used by the gateway. Detection uses the installed Tailscale client.",
+                    "Trusted Headscale or MagicDNS HTTPS URL opened by clients.",
+                ),
+                proxy_connection_fields(
+                    "Public HTTPS URL protected by Cloudflare Access. Cloudflare must proxy WebSockets to the loopback origin.",
+                ),
+                proxy_connection_fields(
+                    "Public HTTPS URL served by Caddy on the VPS and forwarded through the loopback-only SSH tunnel.",
+                ),
+                direct_connection_fields(
+                    "Loopback listener and port reached through a client-created SSH local forward.",
+                    "Certificate-valid HTTPS URL used by the desktop browser through its SSH forward.",
+                ),
+                direct_connection_fields(
+                    "Private LAN IP and port used by the gateway. Do not bind to a public interface.",
+                    "Trusted local HTTPS URL used by devices on this LAN.",
+                ),
+                direct_connection_fields(
+                    "Private VPN or loopback IP and port used by the gateway.",
+                    "Trusted HTTPS origin used by clients on the custom private route.",
+                ),
+            ],
+        }),
+        SettingsPageItem::ActionLink(ActionLink {
+            title: "Detect Provider Defaults".into(),
+            description: Some("Fill detected Tailscale, Headscale, or NetBird addresses, or safe loopback defaults for Cloudflare and SSH. Review the result before saving.".into()),
+            button_text: "Detect".into(),
+            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("detect-connection", window, cx)),
+            files: USER,
+        }),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "Enabled",
+            description: "Listen on this connection when the gateway starts. At least one connection must remain enabled.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("zedlink.connection_enabled"),
+                pick: |settings_content| settings_content.zedlink.as_ref()?.connection_enabled.as_ref(),
+                write: |settings_content, value, _| settings_content.zedlink.get_or_insert_default().connection_enabled = value,
+            }),
+            metadata: None,
+            files: USER,
+        }),
+        SettingsPageItem::ActionLink(ActionLink {
+            title: "Save and Activate Connection".into(),
+            description: Some("Validate this profile, save it in ZedLink's private configuration, make it primary, and restart the gateway.".into()),
+            button_text: "Save & Activate".into(),
+            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("save-connection", window, cx)),
+            files: USER,
+        }),
+        SettingsPageItem::ActionLink(ActionLink {
+            title: "Check Connection".into(),
+            description: Some("Test the selected saved profile's certificate trust, HTTPS endpoint, and ZedLink gateway identity from this workstation.".into()),
+            button_text: "Check".into(),
+            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("check-connection", window, cx)),
+            files: USER,
+        }),
+    ]
+}
+
+fn zedlink_page() -> SettingsPage {
+    fn connections_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Connections"),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Connection Providers".into(),
+                r#type: Default::default(),
+                json_path: Some("zedlink.connection_provider"),
+                description: Some("Select, add, validate, and activate private VPN, proxy, and SSH connection profiles.".into()),
+                search_aliases: &["cloudflare", "headscale", "netbird", "provider", "ssh", "tailscale", "twingate", "vpn", "wireguard", "zerotier"],
+                in_json: true,
+                files: USER,
+                render: |this, scroll_handle, window, cx| {
+                    let items = zedlink_connection_settings();
+                    this.render_sub_page_items(items.iter().enumerate(), scroll_handle, window, cx)
+                        .into_any_element()
+                },
+            }),
+        ]
+    }
+
+    fn runtime_section() -> [SettingsPageItem; 4] {
+        [
+            SettingsPageItem::SectionHeader("Runtime and Devices"),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Gateway Control".into(),
+                r#type: Default::default(),
+                json_path: None,
+                description: Some("Start, restart, stop, inspect, and diagnose the configured ZedLink gateway.".into()),
+                search_aliases: &["diagnose", "gateway", "restart", "start", "status", "stop"],
+                in_json: false,
+                files: USER,
+                render: render_zedlink_gateway_page,
+            }),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Paired Devices".into(),
+                r#type: Default::default(),
+                json_path: None,
+                description: Some("Pair a browser or installed web app, view authorized devices, and revoke a selected credential.".into()),
+                search_aliases: &["browser", "device", "pair", "phone", "revoke"],
+                in_json: false,
+                files: USER,
+                render: |this, scroll_handle, window, cx| {
+                    let items = [
+                        SettingsPageItem::SectionHeader("Device Access"),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Pair New Device".into(),
+                            description: Some("Show the current HTTPS gateway address and identity, plus a five-minute QR and manual code for a new phone or browser.".into()),
+                            button_text: "Open Browser QR".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("pair-primary", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Pair New Device in Terminal".into(),
+                            description: Some("Show the one-use QR and manual code in a local Zed terminal using the primary connection. No browser is opened. The challenge expires after five minutes.".into()),
+                            button_text: "Show Terminal QR".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_in_terminal("pair-primary-terminal", "ZedLink: Pair device — Terminal QR", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "View or Revoke Paired Devices".into(),
+                            description: Some("Review existing authorized browsers and apps in a paged list. Select one only if you want to revoke its credential; new pairing uses Open Browser QR above.".into()),
+                            button_text: "Review Devices".into(),
+                            on_click: Arc::new(|_, window, cx| manage_zedlink_devices(window, cx)),
+                            files: USER,
+                        }),
+                    ];
+                    this.render_sub_page_items(items.iter().enumerate(), scroll_handle, window, cx)
+                        .into_any_element()
+                },
+            }),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Tailscale HTTPS".into(),
+                r#type: Default::default(),
+                json_path: None,
+                description: Some("Check Tailscale readiness, inspect certificate health, and manage automatic renewal without entering certificate paths manually.".into()),
+                search_aliases: &["certificate", "https", "magicdns", "renewal", "tailscale", "tls"],
+                in_json: false,
+                files: USER,
+                render: |this, scroll_handle, window, cx| {
+                    let items = [
+                        SettingsPageItem::SectionHeader("Tailscale and TLS"),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Check Tailscale Connection".into(),
+                            description: Some("Check MagicDNS, local DNS acceptance, hostname resolution, private listener, trusted certificate, served certificate, gateway identity, and renewal. Phone reachability is verified separately.".into()),
+                            button_text: "Check".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_in_terminal("tailscale-check", "ZedLink: Check Tailscale connection", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Guided Tailscale Repair".into(),
+                            description: Some("Review and confirm DNS, certificate, and route repairs in the terminal. Saved pairings are preserved; gateway connections may briefly reconnect. Tailnet administrator settings open in your browser.".into()),
+                            button_text: "Review Repairs".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_in_terminal("tailscale-repair", "ZedLink: Guided Tailscale repair", window, cx)),
+                            files: USER,
+                        }),
+
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Open Tailscale DNS and HTTPS Settings".into(),
+                            description: Some("Enable MagicDNS and HTTPS certificates for the tailnet. Tailscale requires an administrator to accept its Certificate Transparency disclosure.".into()),
+                            button_text: "Open Tailscale".into(),
+                            on_click: Arc::new(|_, _, cx| cx.open_url(TAILSCALE_DNS_ADMIN_URL)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Certificate and Renewal Status".into(),
+                            description: Some("Show the configured hostname, certificate expiration, 30-day renewal threshold, and system renewal timer state.".into()),
+                            button_text: "Show Status".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("renewal-status", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Enable Automatic Renewal".into(),
+                            description: Some("Install a private user timer that checks twice daily and renews Tailscale certificates only when fewer than 30 days remain.".into()),
+                            button_text: "Enable".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("install-renewal", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Check for Renewal Now".into(),
+                            description: Some("Run the same bounded renewal check immediately. A renewed certificate is validated and reloaded by the running gateway without clearing sessions or pairings.".into()),
+                            button_text: "Check Now".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("renew-certificates", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Disable Automatic Renewal".into(),
+                            description: Some("Stop and remove the ZedLink certificate timer. Existing certificate files and connection profiles remain unchanged.".into()),
+                            button_text: "Disable".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("remove-renewal", window, cx)),
+                            files: USER,
+                        }),
+                    ];
+                    this.render_sub_page_items(items.iter().enumerate(), scroll_handle, window, cx)
+                        .into_any_element()
+                },
+            }),
+        ]
+    }
+
+    fn bridge_section() -> [SettingsPageItem; 6] {
+        [
+            SettingsPageItem::SectionHeader("Bridge and Startup"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Enable ZedLink",
+                description: "Start ZedLink's private local bridge when patched Zed launches. Restart Zed after changing this setting.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.enabled"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.enabled.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.zedlink.get_or_insert_default().enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Private State Directory",
+                description: "Absolute path to ZedLink's private state directory. The native bridge uses its probe subdirectory.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.state_directory"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.state_directory.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .state_directory = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("/home/you/.local/state/zedlink"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Project Root",
+                description: "Absolute path of the project whose explicitly exposed Agent threads may be controlled remotely.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.project_root"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.project_root.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .project_root = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("/home/you/projects/my-project"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Start Gateway on Launch",
+                description: "Start the configured private HTTPS gateway with patched Zed. The manager keeps TLS and connection profiles in ZedLink's private configuration.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.start_gateway_on_launch"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.start_gateway_on_launch.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .start_gateway_on_launch = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "ZedLink Manager",
+                description: "Absolute path to tools/zedlink_manager.py. Setup fills this automatically and the gateway reads its private connection profiles from disk.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.manager_path"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.manager_path.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .manager_path = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("/absolute/path/to/zedlink/tools/zedlink_manager.py"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+        ]
+    }
+
+    fn access_section() -> [SettingsPageItem; 15] {
+        [
+            SettingsPageItem::SectionHeader("Remote Permissions"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Create Sessions",
+                description: "Allow paired devices to create new native Agent sessions in this project. Every existing thread still requires /remote-control.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_session_creation"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_session_creation.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_session_creation = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Add Attachments",
+                description: "Allow paired devices to add project files or uploaded files to Agent prompts.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_attachments"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_attachments.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_attachments = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Browse Project Files",
+                description: "Allow paired devices to browse, read, and search files inside the configured project root.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_project_context"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_project_context.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_project_context = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Manage Git Changes",
+                description: "Allow paired devices to inspect diffs and stage or unstage changes in the configured project.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_git_changes"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_git_changes.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_git_changes = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Resolve Agent Approvals",
+                description: "Allow paired devices to approve once or deny pending native Agent tool requests.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_approval_decisions"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_approval_decisions.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_approval_decisions = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Change Agent Settings",
+                description: "Allow paired devices to change the native Agent profile and model thinking option for an exposed thread.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_agent_settings"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()
+                            .and_then(|zedlink| zedlink.allow_agent_settings.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_agent_settings = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "View Project Terminals",
+                description: "Allow paired devices to inspect terminals open in this configured project. This is read-only unless Send Terminal Input is also enabled. Changes apply immediately. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_terminal_read"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_terminal_read
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_terminal_read = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Send Terminal Input",
+                description: "Allow paired devices to type into project terminals already open in Zed. Requires View Project Terminals. Changes apply immediately. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_terminal_input"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_terminal_input
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_terminal_input = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Remote Clipboard",
+                description: "Allow explicit text-only reads and writes of the desktop clipboard from paired devices in an exposed session. The clipboard can contain sensitive data. Disabled by default; changes apply immediately.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_remote_clipboard"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_remote_clipboard
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_remote_clipboard = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Stop Project Tasks",
+                description: "Allow paired devices to stop running task-backed terminals in this project. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_task_control"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_task_control
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_task_control = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Start Configured Tasks",
+                description: "Allow paired devices to start tasks already defined in Zed for this project. Raw commands are never accepted. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_task_start"),
+                    pick: |settings_content| {
+                        settings_content.zedlink.as_ref()?.allow_task_start.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_task_start = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "View Debugger Sessions",
+                description: "Allow paired devices to inspect debugger sessions already running in this project. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_debugger_read"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_debugger_read
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_debugger_read = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Start Configured Debuggers",
+                description: "Allow paired devices to start debugger configurations already defined in Zed for this project. Raw adapter configurations are never accepted. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_debugger_start"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_debugger_start
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_debugger_start = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Control Debugger Sessions",
+                description: "Allow paired devices to pause, continue, step, restart, and stop existing debugger sessions. Disabled by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zedlink.allow_debugger_control"),
+                    pick: |settings_content| {
+                        settings_content
+                            .zedlink
+                            .as_ref()?
+                            .allow_debugger_control
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .zedlink
+                            .get_or_insert_default()
+                            .allow_debugger_control = value
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
+    SettingsPage {
+        title: "ZedLink",
+        items: concat_sections![
+            connections_section(),
+            runtime_section(),
+            bridge_section(),
+            access_section()
+        ],
+    }
 }
 
 fn developer_page(cx: &App) -> SettingsPage {

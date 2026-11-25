@@ -199,6 +199,8 @@ impl PromptContextAction {
 pub enum PromptLocalCommand {
     ThumbsUp,
     ThumbsDown,
+    #[cfg(unix)]
+    RemoteControl,
 }
 
 impl PromptLocalCommand {
@@ -206,6 +208,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
+            #[cfg(unix)]
+            Self::RemoteControl => "remote-control",
         }
     }
 
@@ -213,6 +217,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
+            #[cfg(unix)]
+            Self::RemoteControl => "Remote Control",
         }
     }
 
@@ -224,6 +230,8 @@ impl PromptLocalCommand {
             Self::ThumbsDown => {
                 "Rate this response as not helpful. Sends the current conversation to the Zed team."
             }
+            #[cfg(unix)]
+            Self::RemoteControl => "Expose or stop exposing this native Agent thread to ZedLink.",
         }
     }
 
@@ -231,6 +239,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
+            #[cfg(unix)]
+            Self::RemoteControl => IconName::Link,
         }
     }
 }
@@ -1465,6 +1475,7 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                     Option<Hsla>,
                     Arc<dyn Fn(CompletionIntent, &mut Window, &mut App) -> bool + Send + Sync>,
                 );
+                let editor_for_local_command = editor.clone();
                 let slash_candidates: Task<Vec<(SlashCompletionCandidate, Option<SkillInfo>)>> = {
                     let source = source.clone();
                     cx.spawn(async move |_this, cx| {
@@ -1641,16 +1652,31 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                     insert_text_mode: None,
                                     confirm: Some(Arc::new({
                                         let source = source.clone();
-                                        move |intent, _window, cx| {
-                                            cx.defer({
+                                        let editor = editor_for_local_command.clone();
+                                        move |intent, window, cx| {
+                                            window.defer(cx, {
                                                 let source = source.clone();
-                                                move |cx| match intent {
+                                                let editor = editor.clone();
+                                                move |window, cx| match intent {
                                                     CompletionIntent::Complete
                                                     | CompletionIntent::CompleteWithInsert
                                                     | CompletionIntent::CompleteWithReplace => {
                                                         source.run_local_command(command, cx);
                                                     }
-                                                    CompletionIntent::Compose => {}
+                                                    CompletionIntent::Compose => {
+                                                        if let Some(editor) = editor.upgrade() {
+                                                            editor.update(cx, |editor, cx| {
+                                                                editor.insert(
+                                                                    &format!(
+                                                                        "/{}",
+                                                                        command.keyword()
+                                                                    ),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             });
                                             false

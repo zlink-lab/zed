@@ -318,6 +318,31 @@ impl Inventory {
         })
     }
 
+    pub fn configured_tasks_for_worktree(
+        &self,
+        worktree: WorktreeId,
+        task_context: &TaskContext,
+    ) -> Vec<(TaskSourceKind, ResolvedTask)> {
+        self.worktree_templates_from_settings(worktree)
+            .chain(self.global_templates_from_settings())
+            .filter_map(|(source, template)| {
+                let id_base = source.to_id_base();
+                template
+                    .resolve_task(&id_base, task_context)
+                    .map(|task| (source, task))
+            })
+            .collect()
+    }
+
+    pub fn configured_debug_scenarios_for_worktree(
+        &self,
+        worktree: WorktreeId,
+    ) -> Vec<(TaskSourceKind, DebugScenario)> {
+        self.worktree_scenarios_from_settings(worktree)
+            .chain(self.global_debug_scenarios_from_settings())
+            .collect()
+    }
+
     pub fn scenario_scheduled(
         &mut self,
         scenario: DebugScenario,
