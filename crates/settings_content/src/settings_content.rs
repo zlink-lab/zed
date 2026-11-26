@@ -371,6 +371,13 @@ pub struct ZedLinkSettingsContent {
     /// Default: false
     pub all_projects: Option<bool>,
 
+    /// Allows paired devices to list Zed's workspaces, saved SSH servers, and
+    /// thread history, open workspaces (connecting over SSH like the sidebar),
+    /// browse folders on those hosts, and add SSH servers.
+    ///
+    /// Default: false
+    pub allow_workspace_control: Option<bool>,
+
     /// Starts the configured ZedLink gateway when the local bridge starts.
     ///
     /// Default: true

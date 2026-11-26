@@ -65,6 +65,8 @@ const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_TERMINAL_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
 
+mod workspaces;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProbeRequest {
@@ -95,12 +97,15 @@ struct ProbeState {
     terminal_operations: RefCell<HashMap<String, String>>,
     terminal_creations: RefCell<HashMap<String, (String, Value)>>,
     clipboard_operations: RefCell<HashMap<String, String>>,
+    workspaces: workspaces::WorkspaceState,
 }
 
 impl ProbeState {
     /// `None` means threads of every open project are in scope.
     fn thread_scope(&self) -> Option<&Path> {
-        (!self.permissions.get().all_projects).then_some(self.project_root.as_path())
+        let permissions = self.permissions.get();
+        (!permissions.all_projects && !permissions.workspace_control)
+            .then_some(self.project_root.as_path())
     }
 }
 
@@ -108,6 +113,7 @@ impl ProbeState {
 struct ProbePermissions {
     expose_all_threads: bool,
     all_projects: bool,
+    workspace_control: bool,
     session_creation: bool,
     attachments: bool,
     project_context: bool,
@@ -139,6 +145,10 @@ impl ProbePermissions {
             all_projects: settings
                 .as_ref()
                 .and_then(|settings| settings.all_projects)
+                .unwrap_or(false),
+            workspace_control: settings
+                .as_ref()
+                .and_then(|settings| settings.allow_workspace_control)
                 .unwrap_or(false),
             session_creation: settings
                 .as_ref()
@@ -227,6 +237,15 @@ impl ProbePermissions {
                 "thread.unexpose",
             ]);
         }
+        if self.workspace_control {
+            capabilities.extend([
+                "workspace.list",
+                "workspace.open",
+                "thread.open",
+                "host.directory",
+                "host.add",
+            ]);
+        }
         if self.attachments {
             capabilities.extend(["thread.attachments", "thread.rewind_image"]);
             capabilities.push("thread.rewind");
@@ -289,6 +308,9 @@ impl ProbePermissions {
         match method {
             "thread.create" | "thread.create.options" | "thread.rename" | "thread.unexpose" => {
                 self.session_creation
+            }
+            "workspace.list" | "workspace.open" | "thread.open" | "host.directory" | "host.add" => {
+                self.workspace_control
             }
             "thread.rewind_image" | "thread.rewind" => self.attachments,
             "thread.send"
@@ -470,6 +492,7 @@ pub fn init(cx: &mut App) {
                 terminal_operations: RefCell::new(HashMap::new()),
                 terminal_creations: RefCell::new(HashMap::new()),
                 clipboard_operations: RefCell::new(HashMap::new()),
+                workspaces: Default::default(),
             },
         ))
     })();
@@ -537,9 +560,7 @@ pub fn init(cx: &mut App) {
             // Threads must be subscribed before a client asks for them, otherwise
             // events of a turn that finishes while no client is connected are lost.
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
                 cx.update(|cx| expose_all_threads_if_enabled(&state, cx));
             }
         }
@@ -577,6 +598,7 @@ pub(crate) fn toggle_thread_exposure(thread: &Entity<AcpThread>, cx: &mut App) -
 }
 
 fn expose_all_threads_if_enabled(state: &Rc<ProbeState>, cx: &mut App) {
+    workspaces::expose_requested_threads(state, cx);
     if !state.permissions.get().expose_all_threads {
         return;
     }
@@ -1015,6 +1037,11 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                 }),
             )
         }
+        "workspace.list" => workspaces::workspace_list(&request, state, cx),
+        "workspace.open" => workspaces::workspace_open(&request, state, cx),
+        "thread.open" => workspaces::thread_open(&request, state, cx),
+        "host.directory" => workspaces::host_directory(&request, state, cx),
+        "host.add" => workspaces::host_add(&request, state, cx),
         "thread.create" => create_thread(&request, state, cx),
         "thread.create.options" => create_thread_options(&request, state, cx),
         "thread.rename" => rename_thread(&request, state, cx),
