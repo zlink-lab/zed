@@ -97,8 +97,17 @@ struct ProbeState {
     clipboard_operations: RefCell<HashMap<String, String>>,
 }
 
+impl ProbeState {
+    /// `None` means threads of every open project are in scope.
+    fn thread_scope(&self) -> Option<&Path> {
+        (!self.permissions.get().all_projects).then_some(self.project_root.as_path())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ProbePermissions {
+    expose_all_threads: bool,
+    all_projects: bool,
     session_creation: bool,
     attachments: bool,
     project_context: bool,
@@ -123,6 +132,14 @@ impl ProbePermissions {
             .zedlink
             .clone();
         Self {
+            expose_all_threads: settings
+                .as_ref()
+                .and_then(|settings| settings.expose_all_threads)
+                .unwrap_or(false),
+            all_projects: settings
+                .as_ref()
+                .and_then(|settings| settings.all_projects)
+                .unwrap_or(false),
             session_creation: settings
                 .as_ref()
                 .and_then(|settings| settings.allow_session_creation)
@@ -514,9 +531,27 @@ pub fn init(cx: &mut App) {
         }
     }
 
+    cx.spawn({
+        let state = state.clone();
+        async move |cx| {
+            // Threads must be subscribed before a client asks for them, otherwise
+            // events of a turn that finishes while no client is connected are lost.
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                cx.update(|cx| expose_all_threads_if_enabled(&state, cx));
+            }
+        }
+    })
+    .detach();
+
     cx.spawn(async move |cx| {
         while let Ok(command) = receiver.recv().await {
-            let result = cx.update(|cx| handle_request(command.request, &state, cx));
+            let result = cx.update(|cx| {
+                expose_all_threads_if_enabled(&state, cx);
+                handle_request(command.request, &state, cx)
+            });
             if command.response.send(result).is_err() {
                 continue;
             }
@@ -527,7 +562,7 @@ pub fn init(cx: &mut App) {
 
 pub(crate) fn toggle_thread_exposure(thread: &Entity<AcpThread>, cx: &mut App) -> Option<bool> {
     let state = cx.try_global::<ProbeGlobal>()?.0.clone();
-    if !thread_belongs_to_project(thread, &state.project_root, cx) {
+    if !thread_belongs_to_project(thread, state.thread_scope(), cx) {
         return None;
     }
     let id = thread.read(cx).session_id().to_string();
@@ -538,6 +573,15 @@ pub(crate) fn toggle_thread_exposure(thread: &Entity<AcpThread>, cx: &mut App) -
     } else {
         expose_thread(&state, thread, cx);
         Some(true)
+    }
+}
+
+fn expose_all_threads_if_enabled(state: &Rc<ProbeState>, cx: &mut App) {
+    if !state.permissions.get().expose_all_threads {
+        return;
+    }
+    for (thread, _) in loaded_thread_views(state.thread_scope(), cx) {
+        expose_thread(state, &thread, cx);
     }
 }
 
@@ -914,7 +958,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             if !state.exposed_threads.borrow().contains(&record.thread_id) {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             }
-            let entry_index = loaded_thread_views(&state.project_root, cx)
+            let entry_index = loaded_thread_views(state.thread_scope(), cx)
                 .into_iter()
                 .find(|(thread, _)| thread.read(cx).session_id().to_string() == record.thread_id)
                 .and_then(|(thread, view)| {
@@ -933,7 +977,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         }
         "thread.list" => {
             let mut seen = HashSet::new();
-            let threads = loaded_thread_views(&state.project_root, cx)
+            let threads = loaded_thread_views(state.thread_scope(), cx)
                 .into_iter()
                 .filter_map(|(thread, view)| {
                     let thread = thread.read(cx);
@@ -949,6 +993,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                             json!({
                                 "thread_id": id,
                                 "agent": thread_agent_value(&view, cx),
+                                "project": thread_project_name(thread, cx),
                                 "title": thread.title().map(|title| title.to_string()),
                                 "status": format!("{:?}", thread.status()),
                                 "current_turn_id": thread.current_turn_id(),
@@ -981,7 +1026,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             if !state.exposed_threads.borrow().contains(id) {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             }
-            let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
+            let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
                 .into_iter()
                 .find(|(thread, _)| thread.read(cx).session_id().to_string() == id)
             else {
@@ -1149,7 +1194,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     Err(code) => return error(&request.request_id, code),
                 }
             } else {
-                let Some(thread) = loaded_threads(&state.project_root, cx)
+                let Some(thread) = loaded_threads(state.thread_scope(), cx)
                     .into_iter()
                     .find(|thread| thread.read(cx).session_id().to_string() == id)
                 else {
@@ -1197,7 +1242,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                 return error(&request.request_id, "INVALID_REQUEST");
             };
             if !state.exposed_threads.borrow().contains(id)
-                || !loaded_threads(&state.project_root, cx)
+                || !loaded_threads(state.thread_scope(), cx)
                     .into_iter()
                     .any(|thread| thread.read(cx).session_id().to_string() == id)
             {
@@ -1480,7 +1525,7 @@ fn rename_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some(thread) = loaded_threads(&state.project_root, cx)
+    let Some(thread) = loaded_threads(state.thread_scope(), cx)
         .into_iter()
         .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
     else {
@@ -1528,7 +1573,7 @@ fn finish_thread_creation(
     thread: &Entity<AcpThread>,
     cx: &mut App,
 ) {
-    if !thread_belongs_to_project(thread, &state.project_root, cx) {
+    if !thread_belongs_to_project(thread, state.thread_scope(), cx) {
         return;
     }
     let thread_id = thread.read(cx).session_id().to_string();
@@ -1787,7 +1832,7 @@ fn approval_list(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
+    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
     else {
@@ -1832,7 +1877,7 @@ fn approval_response(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -
                 Err(code) => return error(&request.request_id, code),
             }
         } else {
-            let Some(thread) = loaded_threads(&state.project_root, cx)
+            let Some(thread) = loaded_threads(state.thread_scope(), cx)
                 .into_iter()
                 .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
             else {
@@ -1991,7 +2036,7 @@ fn cancel_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> V
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
+    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
     else {
@@ -2016,7 +2061,7 @@ fn exposed_subagent_thread_view(
     if !state.exposed_threads.borrow().contains(parent_thread_id) {
         return Err("THREAD_NOT_EXPOSED");
     }
-    let Some((parent, parent_view)) = loaded_thread_views(&state.project_root, cx)
+    let Some((parent, parent_view)) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == parent_thread_id)
     else {
@@ -2262,7 +2307,7 @@ fn command_list(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
+    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
     else {
@@ -2473,7 +2518,7 @@ fn exposed_thread_view(
     if !state.exposed_threads.borrow().contains(thread_id) {
         return None;
     }
-    let (thread, view) = loaded_thread_views(&state.project_root, cx)
+    let (thread, view) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)?;
     Some((thread, view))
@@ -2893,7 +2938,7 @@ fn exposed_thread_for_request(
     if !state.exposed_threads.borrow().contains(thread_id) {
         return Err("THREAD_NOT_EXPOSED");
     }
-    loaded_threads(&state.project_root, cx)
+    loaded_threads(state.thread_scope(), cx)
         .into_iter()
         .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
         .ok_or("THREAD_NOT_EXPOSED")
@@ -3705,7 +3750,7 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     }
     drop(submissions);
 
-    let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
+    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
     else {
@@ -3978,7 +4023,7 @@ fn zedlink_retry_value(retry: Option<(String, usize, usize, u64)>) -> Value {
     }
 }
 
-fn loaded_threads(project_root: &Path, cx: &App) -> Vec<Entity<AcpThread>> {
+fn loaded_threads(project_root: Option<&Path>, cx: &App) -> Vec<Entity<AcpThread>> {
     loaded_thread_views(project_root, cx)
         .into_iter()
         .map(|(thread, _)| thread)
@@ -3996,7 +4041,7 @@ fn terminal_create(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> 
         return error(&request.request_id, "INVALID_REQUEST");
     };
     if !state.exposed_threads.borrow().contains(thread_id)
-        || !loaded_threads(&state.project_root, cx)
+        || !loaded_threads(state.thread_scope(), cx)
             .iter()
             .any(|thread| thread.read(cx).session_id().to_string() == thread_id)
     {
@@ -4976,7 +5021,7 @@ fn terminal_value(view: &Entity<TerminalView>, cx: &App) -> Value {
 }
 
 fn loaded_thread_views(
-    project_root: &Path,
+    project_root: Option<&Path>,
     cx: &App,
 ) -> Vec<(Entity<AcpThread>, Entity<ThreadView>)> {
     let workspaces = workspace::AppState::global(cx)
@@ -5007,7 +5052,31 @@ fn loaded_thread_views(
     threads
 }
 
-fn thread_belongs_to_project(thread: &Entity<AcpThread>, project_root: &Path, cx: &App) -> bool {
+fn thread_project_name(thread: &AcpThread, cx: &App) -> Option<String> {
+    let names = thread
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .filter_map(|worktree| {
+            worktree
+                .read(cx)
+                .abs_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+fn thread_belongs_to_project(
+    thread: &Entity<AcpThread>,
+    project_root: Option<&Path>,
+    cx: &App,
+) -> bool {
+    let Some(project_root) = project_root else {
+        return true;
+    };
     let project = thread.read(cx).project().clone();
     project
         .read(cx)

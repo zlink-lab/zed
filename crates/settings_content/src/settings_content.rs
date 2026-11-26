@@ -359,6 +359,18 @@ pub struct ZedLinkSettingsContent {
     /// may be controlled through ZedLink.
     pub project_root: Option<String>,
 
+    /// Exposes every loaded Agent thread without running /remote-control.
+    ///
+    /// Default: false
+    pub expose_all_threads: Option<bool>,
+
+    /// Makes Agent threads of every open project available, not only threads
+    /// of `project_root`. Project files, terminals, and tasks stay scoped to
+    /// `project_root`.
+    ///
+    /// Default: false
+    pub all_projects: Option<bool>,
+
     /// Starts the configured ZedLink gateway when the local bridge starts.
     ///
     /// Default: true

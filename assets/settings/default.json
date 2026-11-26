@@ -2997,6 +2997,8 @@
     "enabled": false,
     "state_directory": "",
     "project_root": "",
+    "expose_all_threads": false,
+    "all_projects": false,
     "start_gateway_on_launch": true,
     "manager_path": "",
     "allow_session_creation": true,
