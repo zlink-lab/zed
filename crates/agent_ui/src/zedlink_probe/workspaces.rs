@@ -70,16 +70,67 @@ fn project_id(host_id: &str, paths: &[PathBuf]) -> String {
     format!("{host_id}\n{paths}")
 }
 
-/// The `workspace.list` host and project ids of the workspace a thread runs in.
+/// The `workspace.list` host and project ids and labels of the workspace a thread runs in.
 pub(super) fn thread_workspace_value(project: &Entity<project::Project>, cx: &App) -> Value {
     let key = project.read(cx).project_group_key(cx);
     let host_id = host_id(key.host());
     let paths = key.path_list().paths();
     json!({
         "host_id": host_id,
+        "host_label": host_label(key.host()),
         "project_id": (!paths.is_empty()).then(|| project_id(&host_id, paths)),
+        "workspace_label": (!paths.is_empty()).then(|| workspace_label(paths)),
         "workspace_paths": paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
     })
+}
+
+fn host_label(options: Option<&RemoteConnectionOptions>) -> String {
+    match options {
+        None => "This computer".to_string(),
+        Some(options) => options.display_name(),
+    }
+}
+
+fn workspace_label(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) fn is_saved_thread(session_id: &str, cx: &App) -> bool {
+    ThreadMetadataStore::try_global(cx).is_some_and(|store| {
+        store
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(session_id.to_string()))
+            .is_some()
+    })
+}
+
+/// Saved threads only record the agent id; external agents get their display
+/// name from an agent server store of an open project.
+fn saved_thread_agent_name(agent_id: &project::AgentId, cx: &App) -> String {
+    if agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
+        return "Zed Agent".to_string();
+    }
+    open_workspaces(cx)
+        .iter()
+        .find_map(|workspace| {
+            workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .agent_server_store()
+                .read(cx)
+                .agent_display_name(agent_id)
+        })
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| agent_id.to_string())
 }
 
 fn multi_workspace_windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {
@@ -89,7 +140,7 @@ fn multi_workspace_windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {
         .collect()
 }
 
-fn open_workspaces(cx: &App) -> Vec<Entity<Workspace>> {
+pub(super) fn open_workspaces(cx: &App) -> Vec<Entity<Workspace>> {
     multi_workspace_windows(cx)
         .into_iter()
         .filter_map(|window| window.read(cx).ok())
@@ -200,8 +251,9 @@ fn host_value(
     thread_limit: usize,
     cx: &App,
 ) -> Value {
-    let (kind, label, detail, connected) = match &host.options {
-        None => ("local", "This computer".to_string(), None, true),
+    let label = host_label(host.options.as_ref());
+    let (kind, detail, connected) = match &host.options {
+        None => ("local", None, true),
         Some(options) => {
             let kind = match options {
                 RemoteConnectionOptions::Ssh(_) => "ssh",
@@ -212,12 +264,7 @@ fn host_value(
                 RemoteConnectionOptions::Ssh(ssh) => Some(ssh.connection_string()),
                 _ => None,
             };
-            (
-                kind,
-                options.display_name(),
-                detail,
-                remote::has_active_connection(options, cx),
-            )
+            (kind, detail, remote::has_active_connection(options, cx))
         }
     };
     let mut projects = host
@@ -233,24 +280,20 @@ fn host_value(
                 .take(thread_limit)
                 .filter_map(|thread| {
                     let session_id = thread.session_id.as_ref()?.to_string();
+                    let is_native = thread.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref();
                     Some(json!({
                         "thread_id": session_id,
                         "title": thread.title().map(|title| title.to_string()),
                         "agent": thread.agent_id.to_string(),
+                        "agent_id": thread.agent_id.to_string(),
+                        "agent_name": saved_thread_agent_name(&thread.agent_id, cx),
+                        "agent_kind": if is_native { "zed" } else { "external_acp" },
                         "updated_at": thread.updated_at.to_rfc3339(),
                         "loaded": loaded.contains(&session_id),
                     }))
                 })
                 .collect::<Vec<_>>();
-            let name = paths
-                .iter()
-                .map(|path| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned())
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let name = workspace_label(paths);
             let value = json!({
                 "project_id": id,
                 "host_id": host.id,

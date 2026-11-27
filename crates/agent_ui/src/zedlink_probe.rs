@@ -65,6 +65,7 @@ const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_TERMINAL_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
 
+mod uploads;
 mod workspaces;
 
 #[derive(Deserialize)]
@@ -98,6 +99,7 @@ struct ProbeState {
     terminal_creations: RefCell<HashMap<String, (String, Value)>>,
     clipboard_operations: RefCell<HashMap<String, String>>,
     workspaces: workspaces::WorkspaceState,
+    uploads: uploads::UploadState,
 }
 
 impl ProbeState {
@@ -248,6 +250,12 @@ impl ProbePermissions {
         }
         if self.attachments {
             capabilities.extend(["thread.attachments", "thread.rewind_image"]);
+            capabilities.extend([
+                "project.upload.begin",
+                "project.upload.chunk",
+                "project.upload.commit",
+                "project.upload.abort",
+            ]);
             capabilities.push("thread.rewind");
         }
         if self.project_context {
@@ -312,9 +320,16 @@ impl ProbePermissions {
             "workspace.list" | "workspace.open" | "thread.open" | "host.directory" | "host.add" => {
                 self.workspace_control
             }
-            "thread.rewind_image" | "thread.rewind" => self.attachments,
+            "thread.rewind_image"
+            | "thread.rewind"
+            | "project.upload.begin"
+            | "project.upload.chunk"
+            | "project.upload.commit"
+            | "project.upload.abort" => self.attachments,
             "thread.send"
-                if params.get("context_paths").is_some() || params.get("uploads").is_some() =>
+                if params.get("context_paths").is_some()
+                    || params.get("uploads").is_some()
+                    || params.get("upload_refs").is_some() =>
             {
                 self.attachments
             }
@@ -493,6 +508,7 @@ pub fn init(cx: &mut App) {
                 terminal_creations: RefCell::new(HashMap::new()),
                 clipboard_operations: RefCell::new(HashMap::new()),
                 workspaces: Default::default(),
+                uploads: Default::default(),
             },
         ))
     })();
@@ -561,7 +577,10 @@ pub fn init(cx: &mut App) {
             // events of a turn that finishes while no client is connected are lost.
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                cx.update(|cx| expose_all_threads_if_enabled(&state, cx));
+                cx.update(|cx| {
+                    expose_all_threads_if_enabled(&state, cx);
+                    uploads::expire_uploads(&state);
+                });
             }
         }
     })
@@ -569,12 +588,24 @@ pub fn init(cx: &mut App) {
 
     cx.spawn(async move |cx| {
         while let Ok(command) = receiver.recv().await {
-            let result = cx.update(|cx| {
+            let response = cx.update(|cx| {
                 expose_all_threads_if_enabled(&state, cx);
-                handle_request(command.request, &state, cx)
+                dispatch_request(command.request, &state, cx)
             });
-            if command.response.send(result).is_err() {
-                continue;
+            match response {
+                ProbeResponse::Ready(result) => {
+                    if command.response.send(result).is_err() {
+                        continue;
+                    }
+                }
+                ProbeResponse::Pending(task) => {
+                    cx.spawn(async move |_| {
+                        if command.response.send(task.await).is_err() {
+                            log::debug!("ZedLink client left before its request finished");
+                        }
+                    })
+                    .detach();
+                }
             }
         }
     })
@@ -1026,6 +1057,24 @@ fn handle_stream(
     Ok(())
 }
 
+enum ProbeResponse {
+    Ready(Value),
+    Pending(Task<Value>),
+}
+
+/// Requests that wait on I/O resolve on their own task, so they don't hold up the others.
+fn dispatch_request(request: ProbeRequest, state: &Rc<ProbeState>, cx: &mut App) -> ProbeResponse {
+    if request.method == "project.upload.commit"
+        && state
+            .permissions
+            .get()
+            .allows(&request.method, &request.params)
+    {
+        return ProbeResponse::Pending(uploads::upload_commit(&request, state, cx));
+    }
+    ProbeResponse::Ready(handle_request(request, state, cx))
+}
+
 fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
     let permissions = state.permissions.get();
     if !permissions.allows(&request.method, &request.params) {
@@ -1103,7 +1152,9 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                                 workspaces::thread_workspace_value(thread.project(), cx);
                             json!({
                                 "host_id": workspace["host_id"],
+                                "host_label": workspace["host_label"],
                                 "project_id": workspace["project_id"],
+                                "workspace_label": workspace["workspace_label"],
                                 "workspace_paths": workspace["workspace_paths"],
                                 "thread_id": id,
                                 "agent": thread_agent_value(&view, cx),
@@ -1142,16 +1193,12 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             let Some(id) = request.params.get("thread_id").and_then(Value::as_str) else {
                 return error(&request.request_id, "INVALID_REQUEST");
             };
-            if !state.exposed_threads.borrow().contains(id) {
-                return error(&request.request_id, "THREAD_NOT_EXPOSED");
-            }
-            let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
-                .into_iter()
-                .find(|(thread, _)| thread.read(cx).session_id().to_string() == id)
-            else {
-                return error(&request.request_id, "THREAD_NOT_EXPOSED");
+            let (thread, view) = match exposed_thread_entry(id, state, cx) {
+                Ok(entry) => entry,
+                Err(code) => return error(&request.request_id, code),
             };
             let server_view = view.read(cx).server_view.upgrade();
+            let workspace = workspaces::thread_workspace_value(thread.read(cx).project(), cx);
             let thread = thread.read(cx);
             let (active_request_id, active_request_entry_index) =
                 active_remote_submission(thread, view.read(cx));
@@ -1267,6 +1314,11 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "instance_id": state.instance_id,
                     "epoch": state.epoch,
                     "thread_id": id,
+                    "host_id": workspace["host_id"],
+                    "host_label": workspace["host_label"],
+                    "project_id": workspace["project_id"],
+                    "workspace_label": workspace["workspace_label"],
+                    "workspace_paths": workspace["workspace_paths"],
                     "agent": thread_agent_value(&view, cx),
                     "title": thread.title().map(|title| title.to_string()),
                     "status": format!("{:?}", thread.status()),
@@ -1300,9 +1352,6 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             let Some(id) = request.params.get("thread_id").and_then(Value::as_str) else {
                 return error(&request.request_id, "INVALID_REQUEST");
             };
-            if !state.exposed_threads.borrow().contains(id) {
-                return error(&request.request_id, "THREAD_NOT_EXPOSED");
-            }
             let subagent_id = request.params.get("subagent_id").and_then(Value::as_str);
             if subagent_id.is_some() && !matches_instance(&request, state) {
                 return error(&request.request_id, "RESYNC_REQUIRED");
@@ -1313,13 +1362,10 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     Err(code) => return error(&request.request_id, code),
                 }
             } else {
-                let Some(thread) = loaded_threads(state.thread_scope(), cx)
-                    .into_iter()
-                    .find(|thread| thread.read(cx).session_id().to_string() == id)
-                else {
-                    return error(&request.request_id, "THREAD_NOT_EXPOSED");
-                };
-                thread
+                match exposed_thread_entry(id, state, cx) {
+                    Ok((thread, _)) => thread,
+                    Err(code) => return error(&request.request_id, code),
+                }
             };
             let thread = thread.read(cx);
             let total_entries = thread.entries().len();
@@ -1360,12 +1406,8 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             else {
                 return error(&request.request_id, "INVALID_REQUEST");
             };
-            if !state.exposed_threads.borrow().contains(id)
-                || !loaded_threads(state.thread_scope(), cx)
-                    .into_iter()
-                    .any(|thread| thread.read(cx).session_id().to_string() == id)
-            {
-                return error(&request.request_id, "THREAD_NOT_EXPOSED");
+            if let Err(code) = exposed_thread_entry(id, state, cx) {
+                return error(&request.request_id, code);
             }
             let events = state.events.borrow();
             let Some(events) = events.get(id) else {
@@ -1432,6 +1474,9 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         "changes.stage" => change_stage(&request, state, true, cx),
         "changes.unstage" => change_stage(&request, state, false, cx),
         "thread.send" => send_request(&request, state, cx),
+        "project.upload.begin" => uploads::upload_begin(&request, state, cx),
+        "project.upload.chunk" => uploads::upload_chunk(&request, state),
+        "project.upload.abort" => uploads::upload_abort(&request, state),
         "thread.cancel" => cancel_request(&request, state, cx),
         "subagent.cancel" => cancel_subagent_request(&request, state, cx),
         "thread.rewind_image" => rewind_image_request(&request, state, cx),
@@ -1961,14 +2006,9 @@ fn approval_list(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
     let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    if !state.exposed_threads.borrow().contains(thread_id) {
-        return error(&request.request_id, "THREAD_NOT_EXPOSED");
-    }
-    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
-        .into_iter()
-        .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
-    else {
-        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    let (thread, view) = match exposed_thread_entry(thread_id, state, cx) {
+        Ok(entry) => entry,
+        Err(code) => return error(&request.request_id, code),
     };
     let server_view = view.read(cx).server_view.upgrade();
     let thread = thread.read(cx);
@@ -2190,15 +2230,7 @@ fn exposed_subagent_thread_view(
     state: &ProbeState,
     cx: &App,
 ) -> Result<(Entity<AcpThread>, Entity<ThreadView>), &'static str> {
-    if !state.exposed_threads.borrow().contains(parent_thread_id) {
-        return Err("THREAD_NOT_EXPOSED");
-    }
-    let Some((parent, parent_view)) = loaded_thread_views(state.thread_scope(), cx)
-        .into_iter()
-        .find(|(thread, _)| thread.read(cx).session_id().to_string() == parent_thread_id)
-    else {
-        return Err("THREAD_NOT_EXPOSED");
-    };
+    let (parent, parent_view) = exposed_thread_entry(parent_thread_id, state, cx)?;
     let session_id = acp::SessionId::new(subagent_id);
     if parent
         .read(cx)
@@ -3476,13 +3508,30 @@ fn exposed_thread_for_request(
     let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
         return Err("INVALID_REQUEST");
     };
-    if !state.exposed_threads.borrow().contains(thread_id) {
-        return Err("THREAD_NOT_EXPOSED");
+    exposed_thread_entry(thread_id, state, cx).map(|(thread, _)| thread)
+}
+
+/// Exposed threads that Zed hasn't loaded (for example after a restart) report
+/// `THREAD_NOT_LOADED`, so the client knows `thread.open` will bring them back.
+fn exposed_thread_entry(
+    thread_id: &str,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<(Entity<AcpThread>, Entity<ThreadView>), &'static str> {
+    let exposed = state.exposed_threads.borrow().contains(thread_id);
+    if exposed
+        && let Some(entry) = loaded_thread_views(state.thread_scope(), cx)
+            .into_iter()
+            .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
+    {
+        return Ok(entry);
     }
-    loaded_threads(state.thread_scope(), cx)
-        .into_iter()
-        .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
-        .ok_or("THREAD_NOT_EXPOSED")
+    let can_open = state.permissions.get().workspace_control;
+    if exposed || (can_open && workspaces::is_saved_thread(thread_id, cx)) {
+        Err("THREAD_NOT_LOADED")
+    } else {
+        Err("THREAD_NOT_EXPOSED")
+    }
 }
 
 fn exposed_worktree(
@@ -4230,8 +4279,14 @@ fn attachment_content(
         }
         if matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
             content.push(acp::ContentBlock::Image(
-                acp::ImageContent::new(data, mime_type)
-                    .uri(Some(format!("zedlink-upload:///{name}"))),
+                // Zed's message editor drops images whose uri isn't a mention it knows.
+                acp::ImageContent::new(data, mime_type).uri(Some(
+                    acp_thread::MentionUri::PastedImage {
+                        name: name.to_string(),
+                    }
+                    .to_uri()
+                    .to_string(),
+                )),
             ));
         } else if mime_type.starts_with("text/")
             || matches!(mime_type, "application/json" | "application/xml")
@@ -4268,7 +4323,10 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
         return error(&request.request_id, "INSTANCE_UNAVAILABLE");
     }
     if !state.exposed_threads.borrow().contains(thread_id) {
-        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+        let code = exposed_thread_entry(thread_id, state, cx)
+            .err()
+            .unwrap_or("THREAD_NOT_EXPOSED");
+        return error(&request.request_id, code);
     }
     let payload_digest = match payload_digest(&request.params) {
         Ok(digest) => digest,
@@ -4291,11 +4349,9 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     }
     drop(submissions);
 
-    let Some((thread, view)) = loaded_thread_views(state.thread_scope(), cx)
-        .into_iter()
-        .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
-    else {
-        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    let (thread, view) = match exposed_thread_entry(thread_id, state, cx) {
+        Ok(entry) => entry,
+        Err(code) => return error(&request.request_id, code),
     };
     let slash_name = text
         .trim_start()
@@ -4347,6 +4403,7 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
             || text.trim().split_whitespace().count() != 1
             || request.params.get("context_paths").is_some()
             || request.params.get("uploads").is_some()
+            || uploads::has_upload_refs(&request.params)
         {
             return error(&request.request_id, "INVALID_REQUEST");
         }
@@ -4394,7 +4451,8 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
         .is_some_and(|command| command.get("category").and_then(Value::as_str) == Some("native"));
     if native_command
         && (request.params.get("context_paths").is_some()
-            || request.params.get("uploads").is_some())
+            || request.params.get("uploads").is_some()
+            || uploads::has_upload_refs(&request.params))
     {
         return error(&request.request_id, "INVALID_REQUEST");
     }
@@ -4404,6 +4462,10 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
 
     let mut content = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
     match attachment_content(request, state, cx) {
+        Ok(attachments) => content.extend(attachments),
+        Err(code) => return error(&request.request_id, code),
+    }
+    match uploads::upload_ref_content(request, &thread, state, cx) {
         Ok(attachments) => content.extend(attachments),
         Err(code) => return error(&request.request_id, code),
     }
