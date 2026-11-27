@@ -1469,6 +1469,13 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         }
         _ => return error(&request.request_id, "INVALID_REQUEST"),
     };
+    // Optional target workspace (`project_id` from workspace.list / thread.list). Without
+    // it the thread is created in this instance's own project, as before.
+    let target_project_id = match request.params.get("project_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() && id.len() <= 65536 => Some(id.clone()),
+        _ => return error(&request.request_id, "INVALID_REQUEST"),
+    };
 
     {
         let creations = state.creations.borrow();
@@ -1491,10 +1498,16 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         .find_map(|workspace| {
             let workspace = workspace.read(cx);
             let project = workspace.project().clone();
-            let matches_project = project
-                .read(cx)
-                .visible_worktrees(cx)
-                .any(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root);
+            let matches_project = match target_project_id.as_deref() {
+                Some(target) => {
+                    workspaces::thread_workspace_value(&project, cx)["project_id"].as_str()
+                        == Some(target)
+                }
+                None => project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .any(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root),
+            };
             matches_project
                 .then(|| {
                     workspace
