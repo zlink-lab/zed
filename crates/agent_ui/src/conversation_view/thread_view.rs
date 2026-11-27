@@ -2549,6 +2549,14 @@ impl ThreadView {
             .map(|(submission_id, _, entry_start_index)| (*submission_id, *entry_start_index))
     }
 
+    pub(crate) fn remote_submission_records(
+        &self,
+    ) -> impl Iterator<Item = (SubmissionId, usize)> + '_ {
+        self.remote_submissions
+            .iter()
+            .map(|(submission_id, _, entry_start_index)| (*submission_id, *entry_start_index))
+    }
+
     fn send_content_with_remote_origin(
         &mut self,
         contents_task: Task<

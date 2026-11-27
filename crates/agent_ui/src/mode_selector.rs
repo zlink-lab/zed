@@ -58,6 +58,14 @@ impl ModeSelector {
         }
     }
 
+    pub fn all_modes(&self) -> Vec<acp::SessionConfigSelectOption> {
+        self.connection.all_modes()
+    }
+
+    pub fn is_setting_mode(&self) -> bool {
+        self.setting_mode
+    }
+
     pub fn mode(&self) -> acp::SessionConfigValueId {
         self.connection.current_mode()
     }

@@ -77,6 +77,28 @@ impl ConfigOptionsView {
         self.config_options.is_read_only()
     }
 
+    pub fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+        self.config_options.config_options()
+    }
+
+    /// Applies a value the same way the desktop selectors do, including saving it as the
+    /// agent's default once the agent confirms it.
+    pub(crate) fn set_config_option(
+        &self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        set_config_option_and_default(
+            self.config_options.clone(),
+            self.agent_server.clone(),
+            config_id,
+            value,
+            self.fs.clone(),
+            cx,
+        )
+    }
+
     pub fn toggle_category_picker(
         &mut self,
         category: acp::SessionConfigOptionCategory,

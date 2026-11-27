@@ -129,6 +129,36 @@ impl ModelPickerDelegate {
         self.selected_model.as_ref()
     }
 
+    pub fn models(&self) -> Option<&AgentModelList> {
+        self.models.as_ref()
+    }
+
+    /// Selects a listed model the same way confirming it in the picker does.
+    pub(crate) fn select_model_by_id(
+        &mut self,
+        model_id: &str,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Task<Result<()>>> {
+        let model = match self.models.as_ref()? {
+            AgentModelList::Flat(models) => models
+                .iter()
+                .find(|model| model.id.as_str() == model_id)
+                .cloned(),
+            AgentModelList::Grouped(groups) => groups
+                .values()
+                .flatten()
+                .find(|model| model.id.as_str() == model_id)
+                .cloned(),
+        }?;
+        if model.disabled.is_some() {
+            return None;
+        }
+        let task = self.selector.select_model(model.id.clone(), cx);
+        self.selected_model = Some(model);
+        cx.notify();
+        Some(task)
+    }
+
     pub fn favorites_count(&self) -> usize {
         self.favorites.len()
     }

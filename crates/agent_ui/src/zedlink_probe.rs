@@ -27,7 +27,7 @@ use git::{
     repository::{DiffType, RepoPath},
     status::{FileStatus, StageStatus},
 };
-use gpui::{App, AppContext, ClipboardItem, Entity, Global, Subscription, Task};
+use gpui::{App, AppContext, ClipboardItem, Entity, Global, Subscription, Task, TaskExt as _};
 use language_model::LanguageModelRegistry;
 use project::{TaskSourceKind, debugger::session::ThreadId};
 use serde::Deserialize;
@@ -623,13 +623,24 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
                 AcpThreadEvent::EntriesRemoved(range) => Some(range.start),
                 _ => None,
             };
+            let user_origin = match event {
+                AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => entry_index
+                    .filter(|index| {
+                        matches!(
+                            thread.read(cx).entries().get(*index),
+                            Some(AgentThreadEntry::UserMessage(_))
+                        )
+                    })
+                    .map(|index| user_message_origin(&thread, index, cx)),
+                _ => None,
+            };
             let mut events = state.events.borrow_mut();
             let record = events.entry(id.clone()).or_default();
             let Some(sequence) = record.last_sequence.checked_add(1) else {
                 return;
             };
             record.last_sequence = sequence;
-            record.records.push_back(json!({
+            let mut value = json!({
                 "sequence": sequence,
                 "kind": event_kind(event),
                 "stop_reason": match event {
@@ -647,7 +658,22 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
                 },
                 "activity": activity,
                 "entry_index": entry_index,
-            }));
+            });
+            // `entry.added` always carries the origin. A keyed entry can appear before the
+            // receipt naming it, so `entry.updated` repeats it only when it is "remote":
+            // that corrects an earlier label without ever downgrading a remote message.
+            let origin = match (event, user_origin) {
+                (AcpThreadEvent::NewEntry, Some(origin)) => Some(origin),
+                (AcpThreadEvent::EntryUpdated(_), Some("remote")) => Some("remote"),
+                _ => None,
+            };
+            if let (Some(_), Some(fields)) = (user_origin, value.as_object_mut()) {
+                fields.insert("entry_kind".to_string(), json!("user"));
+                if let Some(origin) = origin {
+                    fields.insert("origin".to_string(), json!(origin));
+                }
+            }
+            record.records.push_back(value);
             if record.records.len() > 256 {
                 record.records.pop_front();
             }
@@ -772,6 +798,67 @@ fn remote_submission_entry_index(
                     .map(|offset| entry_start_index + offset)
             })
     })
+}
+
+/// Whether the user message at `entry_index` was submitted through the bridge.
+///
+/// Labelling a phone message "local" would stop its push notifications, so uncertainty
+/// resolves to "remote":
+/// - a keyed entry matching the receipt of a bridge submission is remote;
+/// - with receipt transports the agent may echo a keyed entry before its receipt is known,
+///   so a keyed entry after the start of a bridge submission that is still awaiting its
+///   receipt is remote;
+/// - completion transports push the entry inside the turn of the view's current
+///   submission, so the entry boundary of the current bridge submission identifies it.
+fn user_message_origin(thread: &Entity<AcpThread>, entry_index: usize, cx: &App) -> &'static str {
+    let session_id = thread.read(cx).session_id().clone();
+    let Some(view) = loaded_thread_views(None, cx)
+        .into_iter()
+        .find(|(candidate, _)| candidate.read(cx).session_id() == &session_id)
+        .map(|(_, view)| view)
+    else {
+        return "local";
+    };
+    let thread = thread.read(cx);
+    let view = view.read(cx);
+    let keyed_id = match thread.entries().get(entry_index) {
+        Some(AgentThreadEntry::UserMessage(message)) => match &message.identity {
+            MessageIdentity::Keyed(id) => Some(id),
+            MessageIdentity::Legacy(_) => None,
+        },
+        _ => return "local",
+    };
+    for (submission_id, entry_start_index) in view.remote_submission_records() {
+        if entry_index < entry_start_index {
+            continue;
+        }
+        let Some(submission) = thread.submission(submission_id) else {
+            continue;
+        };
+        match &submission.state {
+            SubmissionState::Accepted { receipt, .. }
+            | SubmissionState::Disconnected {
+                receipt: Some(receipt),
+            } => {
+                if keyed_id == Some(&receipt.message_id) {
+                    return "remote";
+                }
+            }
+            SubmissionState::Pending | SubmissionState::Disconnected { receipt: None }
+                if thread.uses_reported_activity() && keyed_id.is_some() =>
+            {
+                return "remote";
+            }
+            _ => {}
+        }
+    }
+    if let Some((submission_id, _, entry_start_index)) = view.remote_submission()
+        && remote_submission_entry_index(thread, submission_id, entry_start_index)
+            == Some(entry_index)
+    {
+        return "remote";
+    }
+    "local"
 }
 
 fn active_remote_submission(
@@ -1012,7 +1099,12 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                             );
                             let retry_status =
                                 zedlink_retry_value(view.read(cx).zedlink_retry_status());
+                            let workspace =
+                                workspaces::thread_workspace_value(thread.project(), cx);
                             json!({
+                                "host_id": workspace["host_id"],
+                                "project_id": workspace["project_id"],
+                                "workspace_paths": workspace["workspace_paths"],
                                 "thread_id": id,
                                 "agent": thread_agent_value(&view, cx),
                                 "project": thread_project_name(thread, cx),
@@ -2456,6 +2548,8 @@ fn update_thread_settings(request: &ProbeRequest, state: &ProbeState, cx: &mut A
                 | "thinking_enabled"
                 | "model_id"
                 | "provider_id"
+                | "mode_id"
+                | "config_option"
         )
     }) {
         return error(&request.request_id, "INVALID_REQUEST");
@@ -2472,26 +2566,104 @@ fn update_thread_settings(request: &ProbeRequest, state: &ProbeState, cx: &mut A
         Some(Value::Bool(enabled)) => Some(*enabled),
         _ => return error(&request.request_id, "INVALID_REQUEST"),
     };
+    // External agents' models have no provider, so `provider_id` may be absent there.
     let requested_model = match (parameters.get("provider_id"), parameters.get("model_id")) {
         (None, None) => None,
-        (Some(Value::String(provider_id)), Some(Value::String(model_id)))
-            if !provider_id.is_empty()
-                && provider_id.len() <= 128
-                && !model_id.is_empty()
-                && model_id.len() <= 256 =>
+        (provider_id, Some(Value::String(model_id)))
+            if !model_id.is_empty()
+                && model_id.len() <= 256
+                && provider_id.is_none_or(|provider_id| {
+                    provider_id.as_str().is_some_and(|provider_id| {
+                        !provider_id.is_empty() && provider_id.len() <= 128
+                    })
+                }) =>
         {
-            Some((provider_id.clone(), model_id.clone()))
+            Some((
+                provider_id.and_then(Value::as_str).map(str::to_string),
+                model_id.clone(),
+            ))
         }
         _ => return error(&request.request_id, "INVALID_REQUEST"),
     };
-    if profile_id.is_none() && thinking_enabled.is_none() && requested_model.is_none() {
+    let mode_id = match parameters.get("mode_id") {
+        None => None,
+        Some(Value::String(mode_id))
+            if !mode_id.is_empty() && mode_id.len() <= MAX_SETTING_ID_BYTES =>
+        {
+            Some(mode_id.as_str())
+        }
+        _ => return error(&request.request_id, "INVALID_REQUEST"),
+    };
+    let config_option = match parameters.get("config_option") {
+        None => None,
+        Some(Value::Object(option))
+            if option.len() == 2
+                && option
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty() && id.len() <= MAX_SETTING_ID_BYTES)
+                && option.get("value").is_some_and(|value| match value {
+                    Value::String(value) => {
+                        !value.is_empty() && value.len() <= MAX_SETTING_ID_BYTES
+                    }
+                    Value::Bool(_) => true,
+                    _ => false,
+                }) =>
+        {
+            option
+                .get("id")
+                .and_then(Value::as_str)
+                .zip(option.get("value"))
+        }
+        _ => return error(&request.request_id, "INVALID_REQUEST"),
+    };
+    if profile_id.is_none()
+        && thinking_enabled.is_none()
+        && requested_model.is_none()
+        && mode_id.is_none()
+        && config_option.is_none()
+    {
         return error(&request.request_id, "INVALID_REQUEST");
     }
     let Some((thread, view)) = exposed_thread_view(thread_id, state, cx) else {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     };
     let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+        if profile_id.is_some() || thinking_enabled.is_some() {
+            return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+        }
+        if requested_model.as_ref().is_some_and(|(provider_id, _)| {
+            provider_id
+                .as_deref()
+                .is_some_and(|provider_id| provider_id != EXTERNAL_AGENT_MODEL_PROVIDER_ID)
+        }) {
+            return error(&request.request_id, "INVALID_REQUEST");
+        }
+        let changes = match external_settings_changes(
+            &view,
+            requested_model
+                .as_ref()
+                .map(|(_, model_id)| model_id.as_str()),
+            mode_id,
+            config_option,
+            cx,
+        ) {
+            Ok(changes) => changes,
+            Err(code) => return error(&request.request_id, code),
+        };
+        apply_external_settings_changes(&view, changes, cx);
+        return success(
+            &request.request_id,
+            thread_settings_value(thread_id, &thread, &view, None, cx),
+        );
+    };
+    if mode_id.is_some() || config_option.is_some() {
         return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+    }
+    let requested_model = match requested_model {
+        None => None,
+        Some((Some(provider_id), model_id)) => Some((provider_id, model_id)),
+        Some((None, _)) => return error(&request.request_id, "INVALID_REQUEST"),
     };
     if thread.read(cx).status() != ThreadStatus::Idle {
         return error(&request.request_id, "THREAD_BUSY");
@@ -2560,18 +2732,22 @@ fn thread_settings_value(
 ) -> Value {
     let agent = thread_agent_value(view, cx);
     let Some(native_thread) = native_thread else {
+        let settings = external_agent_settings(view, cx);
         return json!({
             "thread_id": thread_id,
             "status": format!("{:?}", thread.read(cx).status()),
             "agent": agent,
-            "model": Value::Null,
+            "model": settings.model,
+            "models": settings.models,
+            "modes": settings.modes,
+            "config_options": settings.config_options,
             "profile_id": Value::Null,
             "profiles": [],
             "thinking_enabled": Value::Null,
             "supports_images": Value::Null,
             "thinking_supported": false,
             "thinking_can_disable": false,
-            "editable": false,
+            "editable": settings.editable,
             "configuration_owner": "external_agent",
             "provisional": true,
         });
@@ -2622,6 +2798,331 @@ fn thread_settings_value(
         "configuration_owner": "zed",
         "provisional": true,
     })
+}
+
+/// External agents' models come from the agent rather than a Zed language-model
+/// provider, so they share this provider id in `thread.settings`.
+const EXTERNAL_AGENT_MODEL_PROVIDER_ID: &str = "acp";
+const MAX_SETTING_ID_BYTES: usize = 128;
+
+struct ExternalAgentSettings {
+    model: Value,
+    models: Value,
+    modes: Value,
+    config_options: Value,
+    editable: bool,
+}
+
+/// Reads the selectors the desktop thread view built for this session, so the phone
+/// sees and changes exactly what the desktop toolbar shows. Config options take
+/// precedence over the mode and model selectors there, so at most one side is present.
+fn external_agent_settings(view: &Entity<ThreadView>, cx: &App) -> ExternalAgentSettings {
+    let view = view.read(cx);
+    let mut editable = false;
+
+    let (model, models) = match view.model_selector.as_ref() {
+        Some(selector) => {
+            let selector = selector.read(cx);
+            let models = selector.available_models(cx).map(|models| {
+                let models = match models {
+                    acp_thread::AgentModelList::Flat(models) => models
+                        .iter()
+                        .map(|model| external_model_value(model, None))
+                        .collect::<Vec<_>>(),
+                    acp_thread::AgentModelList::Grouped(groups) => groups
+                        .iter()
+                        .flat_map(|(group, models)| {
+                            models
+                                .iter()
+                                .map(|model| external_model_value(model, Some(&group.0)))
+                        })
+                        .collect(),
+                };
+                editable |= models
+                    .iter()
+                    .any(|model| model["disabled"] == Value::Bool(false));
+                Value::Array(models)
+            });
+            let model = selector.active_model(cx).map(|model| {
+                json!({
+                    "id": model.id.as_str(),
+                    "name": model.name.as_ref(),
+                    "provider_id": EXTERNAL_AGENT_MODEL_PROVIDER_ID,
+                })
+            });
+            (model.unwrap_or(Value::Null), models.unwrap_or(Value::Null))
+        }
+        None => (Value::Null, Value::Null),
+    };
+
+    let modes = view.mode_selector.as_ref().map(|selector| {
+        let selector = selector.read(cx);
+        let available = selector
+            .all_modes()
+            .into_iter()
+            .map(|mode| {
+                json!({
+                    "id": mode.value.0.as_ref(),
+                    "name": mode.name,
+                    "description": mode.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        editable |= !available.is_empty();
+        json!({
+            "current": selector.mode().0.as_ref(),
+            "available": available,
+            "changing": selector.is_setting_mode(),
+        })
+    });
+
+    let config_options = view.config_options_view.as_ref().map(|config_view| {
+        let config_view = config_view.read(cx);
+        let read_only = config_view.is_read_only();
+        let options = config_view
+            .config_options()
+            .iter()
+            .map(|option| config_option_value(option, read_only))
+            .collect::<Vec<_>>();
+        editable |= !read_only
+            && options
+                .iter()
+                .any(|option| matches!(option["type"].as_str(), Some("select" | "boolean")));
+        Value::Array(options)
+    });
+
+    ExternalAgentSettings {
+        model,
+        models,
+        modes: modes.unwrap_or(Value::Null),
+        config_options: config_options.unwrap_or(Value::Null),
+        editable,
+    }
+}
+
+fn external_model_value(model: &acp_thread::AgentModelInfo, group: Option<&str>) -> Value {
+    json!({
+        "id": model.id.as_str(),
+        "name": model.name.as_ref(),
+        "description": model.description.as_ref().map(|description| description.as_ref()),
+        "provider_id": EXTERNAL_AGENT_MODEL_PROVIDER_ID,
+        "group": group,
+        "disabled": model.disabled.is_some(),
+        "supports_images": Value::Null,
+        "supports_thinking": false,
+    })
+}
+
+fn config_option_value(option: &acp::SessionConfigOption, read_only: bool) -> Value {
+    let (kind, current_value, options) = match &option.kind {
+        acp::SessionConfigKind::Select(select) => {
+            let option_value = |choice: &acp::SessionConfigSelectOption, group: Option<&str>| {
+                json!({
+                    "value": choice.value.0.as_ref(),
+                    "name": choice.name,
+                    "description": choice.description,
+                    "group": group,
+                })
+            };
+            let options = match &select.options {
+                acp::SessionConfigSelectOptions::Ungrouped(choices) => choices
+                    .iter()
+                    .map(|choice| option_value(choice, None))
+                    .collect::<Vec<_>>(),
+                acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| {
+                        group
+                            .options
+                            .iter()
+                            .map(|choice| option_value(choice, Some(&group.name)))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (
+                "select".to_string(),
+                json!(select.current_value.0.as_ref()),
+                Some(options),
+            )
+        }
+        acp::SessionConfigKind::Boolean(boolean) => (
+            "boolean".to_string(),
+            json!(if boolean.current_value {
+                "true"
+            } else {
+                "false"
+            }),
+            None,
+        ),
+        acp::SessionConfigKind::Other(other) => (other.type_.clone(), Value::Null, None),
+        _ => ("unknown".to_string(), Value::Null, None),
+    };
+    json!({
+        "id": option.config_id.0.as_ref(),
+        "name": option.name,
+        "description": option.description,
+        "category": option
+            .category
+            .as_ref()
+            .and_then(|category| serde_json::to_value(category).ok()),
+        "type": kind,
+        "current_value": current_value,
+        "options": options,
+        "read_only": read_only,
+    })
+}
+
+enum ExternalSettingsChange {
+    Model(String),
+    Mode(acp::SessionConfigValueId),
+    ConfigOption(acp::SessionConfigId, acp::SessionConfigOptionValue),
+}
+
+/// Validates every requested change against what the desktop selectors currently offer
+/// before applying any of them.
+fn external_settings_changes(
+    view: &Entity<ThreadView>,
+    model_id: Option<&str>,
+    mode_id: Option<&str>,
+    config_option: Option<(&str, &Value)>,
+    cx: &App,
+) -> std::result::Result<Vec<ExternalSettingsChange>, &'static str> {
+    let view = view.read(cx);
+    let mut changes = Vec::new();
+    if let Some(model_id) = model_id {
+        let selector = view
+            .model_selector
+            .as_ref()
+            .ok_or("UNSUPPORTED_CAPABILITY")?
+            .read(cx);
+        let models = selector
+            .available_models(cx)
+            .ok_or("SETTINGS_UNAVAILABLE")?;
+        let available = match models {
+            acp_thread::AgentModelList::Flat(models) => models
+                .iter()
+                .any(|model| model.id.as_str() == model_id && model.disabled.is_none()),
+            acp_thread::AgentModelList::Grouped(groups) => groups
+                .values()
+                .flatten()
+                .any(|model| model.id.as_str() == model_id && model.disabled.is_none()),
+        };
+        if !available {
+            return Err("INVALID_REQUEST");
+        }
+        changes.push(ExternalSettingsChange::Model(model_id.to_string()));
+    }
+    if let Some(mode_id) = mode_id {
+        let selector = view
+            .mode_selector
+            .as_ref()
+            .ok_or("UNSUPPORTED_CAPABILITY")?
+            .read(cx);
+        let mode = selector
+            .all_modes()
+            .into_iter()
+            .find(|mode| mode.value.0.as_ref() == mode_id)
+            .ok_or("INVALID_REQUEST")?;
+        changes.push(ExternalSettingsChange::Mode(mode.value));
+    }
+    if let Some((config_id, value)) = config_option {
+        let config_view = view
+            .config_options_view
+            .as_ref()
+            .ok_or("UNSUPPORTED_CAPABILITY")?
+            .read(cx);
+        if config_view.is_read_only() {
+            return Err("UNSUPPORTED_CAPABILITY");
+        }
+        let option = config_view
+            .config_options()
+            .into_iter()
+            .find(|option| option.config_id.0.as_ref() == config_id)
+            .ok_or("INVALID_REQUEST")?;
+        let value = match &option.kind {
+            acp::SessionConfigKind::Select(select) => {
+                let value = value.as_str().ok_or("INVALID_REQUEST")?;
+                let known = match &select.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(choices) => choices
+                        .iter()
+                        .any(|choice| choice.value.0.as_ref() == value),
+                    acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                        .iter()
+                        .flat_map(|group| group.options.iter())
+                        .any(|choice| choice.value.0.as_ref() == value),
+                    _ => false,
+                };
+                if !known {
+                    return Err("INVALID_REQUEST");
+                }
+                acp::SessionConfigOptionValue::id(acp::SessionConfigValueId::new(value))
+            }
+            acp::SessionConfigKind::Boolean(_) => {
+                let value = match value {
+                    Value::Bool(value) => *value,
+                    Value::String(value) if value == "true" => true,
+                    Value::String(value) if value == "false" => false,
+                    _ => return Err("INVALID_REQUEST"),
+                };
+                acp::SessionConfigOptionValue::boolean(value)
+            }
+            _ => return Err("UNSUPPORTED_CAPABILITY"),
+        };
+        changes.push(ExternalSettingsChange::ConfigOption(
+            option.config_id,
+            value,
+        ));
+    }
+    Ok(changes)
+}
+
+/// Applies changes through the desktop selectors so the toolbar stays in sync and the
+/// same defaults are saved. The agent confirms asynchronously; the probe answers each
+/// request synchronously, so the caller gets provisional settings and re-reads
+/// `thread.settings` for the confirmed state.
+fn apply_external_settings_changes(
+    view: &Entity<ThreadView>,
+    changes: Vec<ExternalSettingsChange>,
+    cx: &mut App,
+) {
+    let (model_selector, mode_selector, config_options_view) = {
+        let view = view.read(cx);
+        (
+            view.model_selector.clone(),
+            view.mode_selector.clone(),
+            view.config_options_view.clone(),
+        )
+    };
+    for change in changes {
+        match change {
+            ExternalSettingsChange::Model(model_id) => {
+                let Some(selector) = model_selector.as_ref() else {
+                    continue;
+                };
+                let task = selector.update(cx, |selector, cx| {
+                    selector.select_model_by_id(&model_id, cx)
+                });
+                if let Some(task) = task {
+                    task.detach_and_log_err(cx);
+                }
+            }
+            ExternalSettingsChange::Mode(mode_id) => {
+                if let Some(selector) = mode_selector.as_ref() {
+                    selector.update(cx, |selector, cx| selector.set_mode(mode_id, cx));
+                }
+            }
+            ExternalSettingsChange::ConfigOption(config_id, value) => {
+                if let Some(config_view) = config_options_view.as_ref() {
+                    config_view
+                        .update(cx, |config_view, cx| {
+                            config_view.set_config_option(config_id, value, cx)
+                        })
+                        .detach_and_log_err(cx);
+                }
+            }
+        }
+    }
 }
 
 fn thread_agent_value(view: &Entity<ThreadView>, cx: &App) -> Value {

@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
-use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelSelector};
-use gpui::{Entity, FocusHandle};
+use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
+use anyhow::Result;
+use gpui::{Entity, FocusHandle, Task};
 use picker::popover_menu::PickerPopoverMenu;
 use ui::{PopoverMenuHandle, Tooltip, prelude::*};
 
@@ -34,6 +35,20 @@ impl ModelSelectorPopover {
 
     pub fn active_model<'a>(&self, cx: &'a App) -> Option<&'a AgentModelInfo> {
         self.selector.read(cx).delegate.active_model()
+    }
+
+    pub(crate) fn available_models<'a>(&self, cx: &'a App) -> Option<&'a AgentModelList> {
+        self.selector.read(cx).delegate.models()
+    }
+
+    pub(crate) fn select_model_by_id(
+        &self,
+        model_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        self.selector.update(cx, |selector, cx| {
+            selector.delegate.select_model_by_id(model_id, cx)
+        })
     }
 
     pub fn cycle_favorite_models(&self, window: &mut Window, cx: &mut Context<Self>) {

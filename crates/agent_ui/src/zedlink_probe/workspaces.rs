@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use futures::StreamExt as _;
-use gpui::{AnyWindowHandle, TaskExt as _, WindowHandle};
+use gpui::{AnyWindowHandle, WindowHandle};
 use remote::{RemoteConnectionOptions, SshConnectionOptions};
 use workspace::{MultiWorkspace, OpenMode, PathList, ProjectGroupKey, Workspace};
 
@@ -68,6 +68,18 @@ fn project_id(host_id: &str, paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{host_id}\n{paths}")
+}
+
+/// The `workspace.list` host and project ids of the workspace a thread runs in.
+pub(super) fn thread_workspace_value(project: &Entity<project::Project>, cx: &App) -> Value {
+    let key = project.read(cx).project_group_key(cx);
+    let host_id = host_id(key.host());
+    let paths = key.path_list().paths();
+    json!({
+        "host_id": host_id,
+        "project_id": (!paths.is_empty()).then(|| project_id(&host_id, paths)),
+        "workspace_paths": paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+    })
 }
 
 fn multi_workspace_windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {
