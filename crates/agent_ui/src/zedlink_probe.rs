@@ -246,6 +246,7 @@ impl ProbePermissions {
                 "thread.open",
                 "host.directory",
                 "host.add",
+                "instance.quit",
             ]);
         }
         if self.attachments {
@@ -317,9 +318,8 @@ impl ProbePermissions {
             "thread.create" | "thread.create.options" | "thread.rename" | "thread.unexpose" => {
                 self.session_creation
             }
-            "workspace.list" | "workspace.open" | "thread.open" | "host.directory" | "host.add" => {
-                self.workspace_control
-            }
+            "workspace.list" | "workspace.open" | "thread.open" | "host.directory" | "host.add"
+            | "instance.quit" => self.workspace_control,
             "thread.rewind_image"
             | "thread.rewind"
             | "project.upload.begin"
@@ -1081,6 +1081,21 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
     }
     match request.method.as_str() {
+        "instance.quit" => {
+            if !matches_instance(&request, state) {
+                return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+            }
+            // Quit after the reply is written, through the normal app quit path so
+            // workspaces and unsaved buffers are serialized (SIGTERM would skip that).
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+            success(&request.request_id, json!({"quitting": true}))
+        }
         "instance.info" => success(
             &request.request_id,
             json!({
