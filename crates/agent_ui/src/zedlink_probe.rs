@@ -33,7 +33,7 @@ use language_model::LanguageModelRegistry;
 use project::{TaskSourceKind, debugger::session::ThreadId};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use settings::SettingsStore;
+use settings::{Settings as _, SettingsStore};
 use sha2::{Digest, Sha256};
 use task::{
     DebugScenario, ResolvedTask, SharedTaskContext, TaskContext, TaskVariables, VariableName,
@@ -42,6 +42,7 @@ use terminal::TaskStatus;
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme::ActiveTheme;
 use util::rel_path::RelPath;
+use worktree::WorktreeSettings;
 
 use crate::agent_panel::{AgentPanel, CreateThreadOptions};
 use crate::conversation_view::{ConversationView, ThreadView};
@@ -66,6 +67,7 @@ const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_TERMINAL_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
 
+mod disk_project;
 mod uploads;
 mod workspaces;
 
@@ -3674,18 +3676,82 @@ fn exposed_thread_entry(
     }
 }
 
-fn exposed_worktree(
+/// Where `project.*` requests read from: an open project's worktree, or the disk folder of a
+/// local project that is listed by `workspace.list` but not open.
+enum ProjectSource {
+    Worktree {
+        worktree: Entity<worktree::Worktree>,
+        /// Canonical root of a local worktree; `None` for remote ones, whose files are not on
+        /// this machine.
+        local_root: Option<PathBuf>,
+    },
+    Disk {
+        root: PathBuf,
+    },
+}
+
+/// Requests name a project by `thread_id` (the thread's project) or by `project_id` from
+/// `workspace.list`; when both are given they must agree.
+fn project_source(
     request: &ProbeRequest,
     state: &ProbeState,
     cx: &App,
-) -> std::result::Result<Entity<worktree::Worktree>, &'static str> {
-    let thread = exposed_thread_for_request(request, state, cx)?;
-    let project = thread.read(cx).project().clone();
-    project
+) -> std::result::Result<ProjectSource, &'static str> {
+    if !matches_instance(request, state) {
+        return Err("INSTANCE_UNAVAILABLE");
+    }
+    let project_id = match request.params.get("project_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(project_id)) => Some(project_id.as_str()),
+        Some(_) => return Err("INVALID_REQUEST"),
+    };
+    let project = if request.params.get("thread_id").is_some() {
+        let project = exposed_thread_for_request(request, state, cx)?
+            .read(cx)
+            .project()
+            .clone();
+        if project_id.is_some_and(|project_id| {
+            workspaces::thread_workspace_value(&project, cx)["project_id"].as_str()
+                != Some(project_id)
+        }) {
+            return Err("INVALID_REQUEST");
+        }
+        project
+    } else {
+        match workspaces::resolve_project_id(project_id.ok_or("INVALID_REQUEST")?, state, cx)? {
+            workspaces::ProjectLocation::Open(project) => project,
+            workspaces::ProjectLocation::ClosedLocal(root) => {
+                return Ok(ProjectSource::Disk { root });
+            }
+        }
+    };
+    let worktree = project
         .read(cx)
         .visible_worktrees(cx)
         .find(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root)
-        .ok_or("INSTANCE_UNAVAILABLE")
+        .or_else(|| uploads::upload_worktree(&project, cx))
+        .ok_or("INSTANCE_UNAVAILABLE")?;
+    let local_root = if project.read(cx).is_local() {
+        Some(
+            fs::canonicalize(worktree.read(cx).abs_path().as_ref())
+                .map_err(|_| "INSTANCE_UNAVAILABLE")?,
+        )
+    } else {
+        None
+    };
+    Ok(ProjectSource::Worktree {
+        worktree,
+        local_root,
+    })
+}
+
+fn visible_worktree_entry(entry: &worktree::Entry) -> bool {
+    !entry.is_hidden
+        && !entry.is_private
+        && !entry.is_external
+        && !entry.is_fifo
+        && !entry.is_ignored
+        && !excluded_remote_path(entry.path.as_unix_str())
 }
 
 fn excluded_remote_path(path: &str) -> bool {
@@ -3738,30 +3804,34 @@ fn safe_project_entry(
     {
         return Err("INVALID_REQUEST");
     }
-    let worktree = exposed_worktree(request, state, cx)?;
+    let (worktree, root) = match project_source(request, state, cx)? {
+        ProjectSource::Disk { root } => {
+            return disk_project::disk_file(&root, path, WorktreeSettings::get_global(cx));
+        }
+        ProjectSource::Worktree {
+            local_root: None, ..
+        } => return Err("UNSUPPORTED_CAPABILITY"),
+        ProjectSource::Worktree {
+            worktree,
+            local_root: Some(root),
+        } => (worktree, root),
+    };
     let allowed = worktree.read(cx).entries(false, 0).any(|entry| {
-        entry.path.as_unix_str() == path
-            && !entry.is_dir()
-            && !entry.is_hidden
-            && !entry.is_private
-            && !entry.is_external
-            && !entry.is_fifo
-            && !entry.is_ignored
+        entry.path.as_unix_str() == path && !entry.is_dir() && visible_worktree_entry(entry)
     });
     if !allowed {
         return Err("FILE_UNAVAILABLE");
     }
-    let candidate =
-        fs::canonicalize(state.project_root.join(relative)).map_err(|_| "FILE_UNAVAILABLE")?;
-    if !candidate.starts_with(&state.project_root) || !candidate.is_file() {
+    let candidate = fs::canonicalize(root.join(relative)).map_err(|_| "FILE_UNAVAILABLE")?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
         return Err("FILE_UNAVAILABLE");
     }
     Ok(candidate)
 }
 
 fn project_files(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
-    let worktree = match exposed_worktree(request, state, cx) {
-        Ok(worktree) => worktree,
+    let source = match project_source(request, state, cx) {
+        Ok(source) => source,
         Err(code) => return error(&request.request_id, code),
     };
     let directory = if request.method == "project.directory" {
@@ -3779,20 +3849,27 @@ fn project_files(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             {
                 return error(&request.request_id, "INVALID_REQUEST");
             }
-            let allowed = worktree.read(cx).entries(false, 0).any(|entry| {
-                entry.path.as_unix_str() == path
-                    && entry.is_dir()
-                    && !entry.is_hidden
-                    && !entry.is_private
-                    && !entry.is_external
-                    && !entry.is_fifo
-                    && !entry.is_ignored
-            });
-            let absolute = fs::canonicalize(state.project_root.join(path));
-            if !allowed
-                || !absolute
-                    .is_ok_and(|path| path.starts_with(&state.project_root) && path.is_dir())
-            {
+            let allowed = match &source {
+                ProjectSource::Worktree {
+                    worktree,
+                    local_root,
+                } => {
+                    worktree.read(cx).entries(false, 0).any(|entry| {
+                        entry.path.as_unix_str() == path
+                            && entry.is_dir()
+                            && visible_worktree_entry(entry)
+                    }) && local_root.as_ref().is_none_or(|root| {
+                        fs::canonicalize(root.join(path))
+                            .is_ok_and(|path| path.starts_with(root) && path.is_dir())
+                    })
+                }
+                ProjectSource::Disk { root } => disk_project::disk_directory_allowed(
+                    root,
+                    path,
+                    WorktreeSettings::get_global(cx),
+                ),
+            };
+            if !allowed {
                 return error(&request.request_id, "FILE_UNAVAILABLE");
             }
         }
@@ -3800,43 +3877,67 @@ fn project_files(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
     } else {
         None
     };
-    let mut truncated = false;
-    let entries = worktree
-        .read(cx)
-        .entries(false, 0)
-        .filter(|entry| {
-            !entry.path.is_empty()
-                && !entry.is_hidden
-                && !entry.is_private
-                && !entry.is_external
-                && !entry.is_fifo
-                && !entry.is_ignored
-                && !excluded_remote_path(entry.path.as_unix_str())
-                && directory.is_none_or(|directory| {
-                    let path = entry.path.as_unix_str();
-                    let remainder = if directory.is_empty() {
-                        Some(path)
-                    } else {
-                        path.strip_prefix(directory)
-                            .and_then(|suffix| suffix.strip_prefix('/'))
-                    };
-                    remainder.is_some_and(|path| !path.is_empty() && !path.contains('/'))
+    let (entries, truncated) = match &source {
+        ProjectSource::Worktree { worktree, .. } => {
+            let mut truncated = false;
+            let entries = worktree
+                .read(cx)
+                .entries(false, 0)
+                .filter(|entry| {
+                    !entry.path.is_empty()
+                        && visible_worktree_entry(entry)
+                        && directory.is_none_or(|directory| {
+                            let path = entry.path.as_unix_str();
+                            let remainder = if directory.is_empty() {
+                                Some(path)
+                            } else {
+                                path.strip_prefix(directory)
+                                    .and_then(|suffix| suffix.strip_prefix('/'))
+                            };
+                            remainder.is_some_and(|path| !path.is_empty() && !path.contains('/'))
+                        })
                 })
-        })
-        .take(MAX_PROJECT_FILES + 1)
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            if index == MAX_PROJECT_FILES {
-                truncated = true;
-                return None;
-            }
-            Some(json!({
-                "path": entry.path.as_unix_str(),
-                "kind": if entry.is_dir() { "directory" } else { "file" },
-                "size": entry.size,
-            }))
-        })
-        .collect::<Vec<_>>();
+                .take(MAX_PROJECT_FILES + 1)
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    if index == MAX_PROJECT_FILES {
+                        truncated = true;
+                        return None;
+                    }
+                    Some(json!({
+                        "path": entry.path.as_unix_str(),
+                        "kind": if entry.is_dir() { "directory" } else { "file" },
+                        "size": entry.size,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            (entries, truncated)
+        }
+        ProjectSource::Disk { root } => {
+            let scope = match directory {
+                Some(directory) => disk_project::DiskScope::Directory(directory.to_string()),
+                None => disk_project::DiskScope::Tree,
+            };
+            let (entries, truncated) = disk_project::disk_entries(
+                root,
+                scope,
+                false,
+                MAX_PROJECT_FILES,
+                WorktreeSettings::get_global(cx),
+            );
+            let entries = entries
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "path": entry.path,
+                        "kind": if entry.is_dir { "directory" } else { "file" },
+                        "size": entry.size,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (entries, truncated)
+        }
+    };
     success(
         &request.request_id,
         json!({"entries": entries, "directory": directory, "truncated": truncated, "provisional": false}),
@@ -3972,14 +4073,19 @@ fn project_search(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> V
         .get("case_sensitive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let worktree = match exposed_worktree(request, state, cx) {
-        Ok(worktree) => worktree,
+    let source = match project_source(request, state, cx) {
+        Ok(source) => source,
         Err(code) => return error(&request.request_id, code),
     };
-    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+    let Some(scope) = request
+        .params
+        .get("thread_id")
+        .or_else(|| request.params.get("project_id"))
+        .and_then(Value::as_str)
+    else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    let key = format!("{thread_id}:{case_sensitive}:{query}");
+    let key = format!("{scope}:{case_sensitive}:{query}");
     let existing_search = state.searches.borrow_mut().remove(&key);
     if let Some(record) = existing_search {
         return match record {
@@ -4002,38 +4108,53 @@ fn project_search(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> V
     if state.searches.borrow().len() >= 32 {
         return error(&request.request_id, "RATE_LIMITED");
     }
-    let mut paths = worktree
-        .read(cx)
-        .entries(false, 0)
-        .filter(|entry| {
-            !entry.is_dir()
-                && !entry.is_hidden
-                && !entry.is_private
-                && !entry.is_external
-                && !entry.is_fifo
-                && !entry.is_ignored
-                && !excluded_remote_path(entry.path.as_unix_str())
-        })
-        .take(MAX_SEARCH_FILES + 1)
-        .map(|entry| entry.path.as_unix_str().to_string())
-        .collect::<Vec<_>>();
-    let candidate_truncated = paths.len() > MAX_SEARCH_FILES;
-    paths.truncate(MAX_SEARCH_FILES);
+    let query = query.to_string();
+    let task = match source {
+        ProjectSource::Worktree {
+            local_root: None, ..
+        } => return error(&request.request_id, "UNSUPPORTED_CAPABILITY"),
+        ProjectSource::Worktree {
+            worktree,
+            local_root: Some(project_root),
+        } => {
+            let mut paths = worktree
+                .read(cx)
+                .entries(false, 0)
+                .filter(|entry| !entry.is_dir() && visible_worktree_entry(entry))
+                .take(MAX_SEARCH_FILES + 1)
+                .map(|entry| entry.path.as_unix_str().to_string())
+                .collect::<Vec<_>>();
+            let candidate_truncated = paths.len() > MAX_SEARCH_FILES;
+            paths.truncate(MAX_SEARCH_FILES);
+            cx.background_spawn(async move {
+                search_project_paths(
+                    project_root,
+                    paths,
+                    query,
+                    case_sensitive,
+                    candidate_truncated,
+                )
+            })
+        }
+        ProjectSource::Disk { root } => {
+            let settings = WorktreeSettings::get_global(cx).clone();
+            cx.background_spawn(async move {
+                let (entries, candidate_truncated) = disk_project::disk_entries(
+                    &root,
+                    disk_project::DiskScope::Tree,
+                    true,
+                    MAX_SEARCH_FILES,
+                    &settings,
+                );
+                let paths = entries.into_iter().map(|entry| entry.path).collect();
+                search_project_paths(root, paths, query, case_sensitive, candidate_truncated)
+            })
+        }
+    };
     state
         .searches
         .borrow_mut()
         .insert(key.clone(), SearchRecord::Loading);
-    let project_root = state.project_root.clone();
-    let query = query.to_string();
-    let task = cx.background_spawn(async move {
-        search_project_paths(
-            project_root,
-            paths,
-            query,
-            case_sensitive,
-            candidate_truncated,
-        )
-    });
     let probe_state = cx.global::<ProbeGlobal>().0.clone();
     cx.spawn(async move |_cx| {
         let record = task.await;

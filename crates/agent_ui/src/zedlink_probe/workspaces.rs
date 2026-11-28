@@ -318,6 +318,70 @@ fn host_value(
     })
 }
 
+pub(super) enum ProjectLocation {
+    Open(Entity<project::Project>),
+    /// The canonical first folder of a local `workspace.list` project that no window has open.
+    ClosedLocal(PathBuf),
+}
+
+pub(super) fn project_in_scope(
+    project: &Entity<project::Project>,
+    state: &ProbeState,
+    cx: &App,
+) -> bool {
+    let Some(root) = state.thread_scope() else {
+        return true;
+    };
+    project
+        .read(cx)
+        .visible_worktrees(cx)
+        .any(|worktree| worktree.read(cx).abs_path().as_ref() == root)
+}
+
+/// Resolves a `workspace.list` `project_id`. Projects that are not open are only reachable
+/// with workspace control, the setting that lists them in the first place.
+pub(super) fn resolve_project_id(
+    project_id: &str,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<ProjectLocation, &'static str> {
+    if let Some(project) = open_workspaces(cx)
+        .into_iter()
+        .map(|workspace| workspace.read(cx).project().clone())
+        .find(|project| {
+            thread_workspace_value(project, cx)["project_id"].as_str() == Some(project_id)
+        })
+    {
+        return if project_in_scope(&project, state, cx) {
+            Ok(ProjectLocation::Open(project))
+        } else {
+            Err("INVALID_REQUEST")
+        };
+    }
+    if !state.permissions.get().workspace_control {
+        return Err("INVALID_REQUEST");
+    }
+    let hosts = collect_hosts(&state.workspaces, cx);
+    let (host, paths) = hosts
+        .iter()
+        .find_map(|host| {
+            host.projects
+                .keys()
+                .find(|paths| self::project_id(&host.id, paths) == project_id)
+                .map(|paths| (host, paths))
+        })
+        .ok_or("INVALID_REQUEST")?;
+    if host.options.is_some() {
+        return Err("PROJECT_NOT_OPEN");
+    }
+    let first = paths.first().ok_or("INVALID_REQUEST")?;
+    let root = fs::canonicalize(first).map_err(|_| "WORKSPACE_UNAVAILABLE")?;
+    if !root.is_dir() {
+        return Err("WORKSPACE_UNAVAILABLE");
+    }
+    Ok(ProjectLocation::ClosedLocal(root))
+}
+
 fn probe_state(cx: &App) -> Option<Rc<ProbeState>> {
     cx.try_global::<ProbeGlobal>()
         .map(|global| global.0.clone())

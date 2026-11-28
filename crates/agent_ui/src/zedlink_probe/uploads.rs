@@ -4,6 +4,7 @@ use acp_thread::MentionUri;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{AsyncApp, WeakEntity};
 use project::{Project, ProjectPath, WorktreeId};
+use util::ResultExt as _;
 
 use super::*;
 
@@ -31,10 +32,19 @@ pub(super) struct UploadState {
 
 #[derive(Clone)]
 struct UploadTarget {
-    project: WeakEntity<Project>,
-    worktree_id: WorktreeId,
+    destination: UploadDestination,
     project_id: String,
     host_id: Value,
+}
+
+#[derive(Clone)]
+enum UploadDestination {
+    Worktree {
+        project: WeakEntity<Project>,
+        worktree_id: WorktreeId,
+    },
+    /// The canonical folder of a local project that is not open in Zed.
+    Disk { root: PathBuf },
 }
 
 struct PendingUpload {
@@ -270,16 +280,6 @@ pub(super) fn upload_worktree(
         .or_else(|| worktrees.first().cloned())
 }
 
-fn project_in_scope(project: &Entity<Project>, state: &ProbeState, cx: &App) -> bool {
-    let Some(root) = state.thread_scope() else {
-        return true;
-    };
-    project
-        .read(cx)
-        .visible_worktrees(cx)
-        .any(|worktree| worktree.read(cx).abs_path().as_ref() == root)
-}
-
 fn upload_target(
     request: &ProbeRequest,
     state: &ProbeState,
@@ -296,15 +296,16 @@ fn upload_target(
         }
         (None, Some(project_id)) => {
             let project_id = project_id.as_str().ok_or("INVALID_REQUEST")?;
-            workspaces::open_workspaces(cx)
-                .into_iter()
-                .map(|workspace| workspace.read(cx).project().clone())
-                .find(|project| {
-                    workspaces::thread_workspace_value(project, cx)["project_id"].as_str()
-                        == Some(project_id)
-                })
-                .filter(|project| project_in_scope(project, state, cx))
-                .ok_or("INVALID_REQUEST")?
+            match workspaces::resolve_project_id(project_id, state, cx)? {
+                workspaces::ProjectLocation::Open(project) => project,
+                workspaces::ProjectLocation::ClosedLocal(root) => {
+                    return Ok(UploadTarget {
+                        destination: UploadDestination::Disk { root },
+                        project_id: project_id.to_string(),
+                        host_id: json!(workspaces::host_id(None)),
+                    });
+                }
+            }
         }
     };
     let workspace = workspaces::thread_workspace_value(&project, cx);
@@ -317,8 +318,10 @@ fn upload_target(
     }
     let worktree = upload_worktree(&project, cx).ok_or("UPLOAD_FAILED")?;
     Ok(UploadTarget {
-        project: project.downgrade(),
-        worktree_id: worktree.read(cx).id(),
+        destination: UploadDestination::Worktree {
+            project: project.downgrade(),
+            worktree_id: worktree.read(cx).id(),
+        },
         project_id: target_project_id,
         host_id: workspace["host_id"].clone(),
     })
@@ -517,8 +520,35 @@ pub(super) fn upload_commit(
                     let target = upload.target.clone();
                     let display_name = upload.display_name.clone();
                     let mime_type = upload.mime_type.clone();
-                    async move |cx| {
-                        write_upload(&state, target, display_name, mime_type, data, cx).await
+                    async move |cx| match &target.destination {
+                        UploadDestination::Worktree {
+                            project,
+                            worktree_id,
+                        } => {
+                            write_upload(
+                                &state,
+                                &target,
+                                project,
+                                *worktree_id,
+                                display_name,
+                                mime_type,
+                                data,
+                                cx,
+                            )
+                            .await
+                        }
+                        UploadDestination::Disk { root } => {
+                            write_disk_upload(
+                                &state,
+                                &target,
+                                root,
+                                display_name,
+                                mime_type,
+                                data,
+                                cx,
+                            )
+                            .await
+                        }
                     }
                 })
                 .shared();
@@ -549,24 +579,49 @@ pub(super) fn upload_commit(
     })
 }
 
+fn uploads_directory() -> String {
+    format!(
+        "{UPLOADS_DIRECTORY}/{}",
+        chrono::Local::now().format("%Y-%m-%d")
+    )
+}
+
+fn committed_upload_value(
+    target: &UploadTarget,
+    relative_path: &str,
+    abs_path: &Path,
+    file_name: &str,
+    mime_type: &str,
+    size: usize,
+) -> Value {
+    json!({
+        "upload_ref": relative_path,
+        "abs_path": abs_path.to_string_lossy(),
+        "relative_path": relative_path,
+        "display_name": file_name,
+        "mime_type": mime_type,
+        "size": size,
+        "kind": upload_kind(mime_type),
+        "project_id": target.project_id,
+        "host_id": target.host_id,
+    })
+}
+
 async fn write_upload(
     state: &Rc<ProbeState>,
-    target: UploadTarget,
+    target: &UploadTarget,
+    project: &WeakEntity<Project>,
+    worktree_id: WorktreeId,
     display_name: String,
     mime_type: String,
     data: Vec<u8>,
     cx: &mut AsyncApp,
 ) -> std::result::Result<Value, &'static str> {
-    let project = target.project.upgrade().ok_or("UPLOAD_FAILED")?;
+    let project = project.upgrade().ok_or("UPLOAD_FAILED")?;
     let worktree = project
-        .read_with(cx, |project, cx| {
-            project.worktree_for_id(target.worktree_id, cx)
-        })
+        .read_with(cx, |project, cx| project.worktree_for_id(worktree_id, cx))
         .ok_or("UPLOAD_FAILED")?;
-    let directory = format!(
-        "{UPLOADS_DIRECTORY}/{}",
-        chrono::Local::now().format("%Y-%m-%d")
-    );
+    let directory = uploads_directory();
 
     let mut chosen = None;
     for attempt in 1..=MAX_COLLISION_ATTEMPTS {
@@ -646,17 +701,148 @@ async fn write_upload(
             committed_at: Instant::now(),
         },
     );
-    Ok(json!({
-        "upload_ref": relative_path,
-        "abs_path": abs_path.to_string_lossy(),
-        "relative_path": relative_path,
-        "display_name": file_name,
-        "mime_type": mime_type,
-        "size": size,
-        "kind": upload_kind(&mime_type),
-        "project_id": target.project_id,
-        "host_id": target.host_id,
-    }))
+    Ok(committed_upload_value(
+        target,
+        &relative_path,
+        &abs_path,
+        &file_name,
+        &mime_type,
+        size,
+    ))
+}
+
+async fn write_disk_upload(
+    state: &Rc<ProbeState>,
+    target: &UploadTarget,
+    root: &Path,
+    display_name: String,
+    mime_type: String,
+    data: Vec<u8>,
+    cx: &mut AsyncApp,
+) -> std::result::Result<Value, &'static str> {
+    let size = data.len();
+    let image = is_attachable_image(&mime_type).then(|| Arc::new(data.clone()));
+    let directory = uploads_directory();
+    let (file_name, relative_path, abs_path) = cx
+        .background_spawn({
+            let root = root.to_path_buf();
+            let display_name = display_name.clone();
+            async move { write_disk_upload_file(&root, &directory, &display_name, &data) }
+        })
+        .await?;
+
+    if !state
+        .uploads
+        .git_excluded_projects
+        .borrow()
+        .contains(&target.project_id)
+    {
+        let root = root.to_path_buf();
+        match cx
+            .background_spawn(async move { exclude_disk_uploads_from_git(&root) })
+            .await
+        {
+            Ok(()) => {
+                state
+                    .uploads
+                    .git_excluded_projects
+                    .borrow_mut()
+                    .insert(target.project_id.clone());
+            }
+            Err(exclude_error) => {
+                log::warn!("ZedLink could not add .zlink/ to .git/info/exclude: {exclude_error:#}")
+            }
+        }
+    }
+
+    remember_committed_upload(
+        state,
+        CommittedUpload {
+            project_id: target.project_id.clone(),
+            relative_path: relative_path.clone(),
+            mime_type: mime_type.clone(),
+            image,
+            committed_at: Instant::now(),
+        },
+    );
+    Ok(committed_upload_value(
+        target,
+        &relative_path,
+        &abs_path,
+        &file_name,
+        &mime_type,
+        size,
+    ))
+}
+
+/// Creates the file with `create_new`, so a concurrent upload or an existing file is never
+/// overwritten, and refuses an uploads directory that resolves outside the project.
+fn write_disk_upload_file(
+    root: &Path,
+    directory: &str,
+    display_name: &str,
+    data: &[u8],
+) -> std::result::Result<(String, String, PathBuf), &'static str> {
+    let target_directory = root.join(directory);
+    fs::create_dir_all(&target_directory).map_err(|create_error| {
+        log::warn!("ZedLink upload directory could not be created: {create_error:#}");
+        "UPLOAD_FAILED"
+    })?;
+    let target_directory = fs::canonicalize(&target_directory).map_err(|_| "UPLOAD_FAILED")?;
+    if !target_directory.starts_with(root) {
+        return Err("UPLOAD_FAILED");
+    }
+    for attempt in 1..=MAX_COLLISION_ATTEMPTS {
+        let file_name = collision_candidate(display_name, attempt);
+        let abs_path = target_directory.join(&file_name);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs_path);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(open_error) if open_error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(open_error) => {
+                log::warn!("ZedLink upload could not be created: {open_error:#}");
+                return Err("UPLOAD_FAILED");
+            }
+        };
+        if let Err(write_error) = file.write_all(data).and_then(|()| file.sync_all()) {
+            log::warn!("ZedLink upload could not be written: {write_error:#}");
+            fs::remove_file(&abs_path).log_err();
+            return Err("UPLOAD_FAILED");
+        }
+        return Ok((
+            file_name.clone(),
+            format!("{directory}/{file_name}"),
+            abs_path,
+        ));
+    }
+    Err("UPLOAD_FAILED")
+}
+
+/// Only a plain `.git` directory in the project folder or above is handled; linked worktrees
+/// (a `.git` file) are left alone, as for remote workspaces.
+fn exclude_disk_uploads_from_git(root: &Path) -> Result<()> {
+    let Some(git_directory) = root
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .find(|git| git.exists())
+        .filter(|git| git.is_dir())
+    else {
+        return Ok(());
+    };
+    let exclude_path = git_directory.join("info").join("exclude");
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(existing) => existing,
+        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(read_error) => return Err(read_error.into()),
+    };
+    if let Some(suffix) = git_exclude_suffix(&existing) {
+        fs::create_dir_all(git_directory.join("info"))?;
+        fs::write(&exclude_path, format!("{existing}{suffix}"))?;
+    }
+    Ok(())
 }
 
 fn remember_committed_upload(state: &ProbeState, upload: CommittedUpload) {

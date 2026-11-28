@@ -67,6 +67,7 @@ gpui_tokio.workspace = true
 html_to_markdown.workspace = true
 http_client.workspace = true
 idna.workspace = true
+ignore.workspace = true
 indoc.workspace = true
 itertools.workspace = true
 jsonschema.workspace = true
