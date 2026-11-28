@@ -10,12 +10,13 @@ use std::{
     path::{Component, Path, PathBuf},
     rc::Rc,
     sync::mpsc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, AuthorizationKind,
-    MessageIdentity, SelectedPermissionOutcome, SubmissionState, ThreadStatus, ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentRateLimit, AgentThreadEntry, AssistantMessageChunk,
+    AuthorizationKind, MessageIdentity, SelectedPermissionOutcome, SubmissionState, ThreadStatus,
+    ToolCallStatus, TurnUsage,
 };
 use agent_client_protocol::v2::schema as acp;
 use agent_settings::{AgentProfile, AgentProfileId};
@@ -98,6 +99,8 @@ struct ProbeState {
     terminal_operations: RefCell<HashMap<String, String>>,
     terminal_creations: RefCell<HashMap<String, (String, Value)>>,
     clipboard_operations: RefCell<HashMap<String, String>>,
+    /// Keyed by agent id and rate limit type; outlives the threads that reported them.
+    rate_limits: RefCell<HashMap<(String, String), RateLimitRecord>>,
     workspaces: workspaces::WorkspaceState,
     uploads: uploads::UploadState,
 }
@@ -214,6 +217,7 @@ impl ProbePermissions {
     fn capabilities(self) -> Vec<&'static str> {
         let mut capabilities = vec![
             "thread.list",
+            "agent.limits",
             "thread.snapshot",
             "thread.snapshot.delta",
             "thread.history",
@@ -507,6 +511,7 @@ pub fn init(cx: &mut App) {
                 terminal_operations: RefCell::new(HashMap::new()),
                 terminal_creations: RefCell::new(HashMap::new()),
                 clipboard_operations: RefCell::new(HashMap::new()),
+                rate_limits: RefCell::new(HashMap::new()),
                 workspaces: Default::default(),
                 uploads: Default::default(),
             },
@@ -647,6 +652,9 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
         let state = state.clone();
         let id = id.clone();
         move |thread, event: &AcpThreadEvent, cx| {
+            if matches!(event, AcpThreadEvent::TokenUsageUpdated(_)) {
+                record_thread_rate_limit(&state, &thread, cx);
+            }
             let activity = thread_activity_value(thread.read(cx));
             let entry_index = match event {
                 AcpThreadEvent::NewEntry => thread.read(cx).entries().len().checked_sub(1),
@@ -698,6 +706,13 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
                 (AcpThreadEvent::EntryUpdated(_), Some("remote")) => Some("remote"),
                 _ => None,
             };
+            if let (AcpThreadEvent::Stopped { .. }, Some(usage), Some(fields)) = (
+                event,
+                thread.read(cx).last_turn_usage(),
+                value.as_object_mut(),
+            ) {
+                fields.insert("usage".to_string(), turn_usage_value(usage));
+            }
             if let (Some(_), Some(fields)) = (user_origin, value.as_object_mut()) {
                 fields.insert("entry_kind".to_string(), json!("user"));
                 if let Some(origin) = origin {
@@ -716,6 +731,111 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
         .borrow_mut()
         .insert(id.clone(), subscription);
     state.exposed_threads.borrow_mut().insert(id);
+}
+
+fn turn_usage_value(usage: TurnUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "thought_tokens": usage.thought_tokens,
+    })
+}
+
+struct RateLimitRecord {
+    agent_id: String,
+    agent_name: String,
+    thread_id: String,
+    rate_limit: AgentRateLimit,
+}
+
+fn record_thread_rate_limit(state: &ProbeState, thread: &Entity<AcpThread>, cx: &App) {
+    let Some(rate_limit) = thread.read(cx).rate_limit().cloned() else {
+        return;
+    };
+    let thread_id = thread.read(cx).session_id().to_string();
+    let agent_id = thread.read(cx).connection().agent_id().to_string();
+    let key = (
+        agent_id.clone(),
+        rate_limit.rate_limit_type.clone().unwrap_or_default(),
+    );
+    let mut rate_limits = state.rate_limits.borrow_mut();
+    if rate_limits
+        .get(&key)
+        .is_some_and(|record| record.rate_limit.observed_at >= rate_limit.observed_at)
+    {
+        return;
+    }
+    let agent_name = loaded_thread_views(None, cx)
+        .into_iter()
+        .find(|(candidate, _)| candidate == thread)
+        .map(|(_, view)| view.read(cx).agent_display_name.to_string())
+        .unwrap_or_else(|| agent_id.clone());
+    rate_limits.insert(
+        key,
+        RateLimitRecord {
+            agent_id,
+            agent_name,
+            thread_id,
+            rate_limit,
+        },
+    );
+}
+
+fn agent_limits(request: &ProbeRequest, state: &ProbeState, cx: &App) -> Value {
+    if !params_contain_only(&request.params, &["instance_id", "epoch"]) {
+        return error(&request.request_id, "INVALID_REQUEST");
+    }
+    // An observation can predate the thread's exposure, when no event hook was attached yet.
+    for (thread, _) in loaded_thread_views(state.thread_scope(), cx) {
+        if state
+            .exposed_threads
+            .borrow()
+            .contains(&thread.read(cx).session_id().to_string())
+        {
+            record_thread_rate_limit(state, &thread, cx);
+        }
+    }
+    success(
+        &request.request_id,
+        json!({
+            "instance_id": state.instance_id,
+            "epoch": state.epoch,
+            "limits": rate_limit_values(&state.rate_limits.borrow()),
+        }),
+    )
+}
+
+fn rate_limit_values(records: &HashMap<(String, String), RateLimitRecord>) -> Vec<Value> {
+    let mut keys = records.keys().collect::<Vec<_>>();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| records.get(key))
+        .map(|record| {
+            let rate_limit = &record.rate_limit;
+            let observed_at_ms = rate_limit
+                .observed_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
+            json!({
+                "agent_id": record.agent_id,
+                "agent_name": record.agent_name,
+                "thread_id": record.thread_id,
+                "observed_at_ms": observed_at_ms,
+                "rate_limit": {
+                    "status": rate_limit.status,
+                    "resets_at": rate_limit.resets_at,
+                    "rate_limit_type": rate_limit.rate_limit_type,
+                    "utilization": rate_limit.utilization,
+                    "surpassed_threshold": rate_limit.surpassed_threshold,
+                    "is_using_overage": rate_limit.is_using_overage,
+                },
+            })
+        })
+        .collect()
 }
 
 fn thread_activity_value(thread: &AcpThread) -> Value {
@@ -1181,6 +1301,10 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                                 "agent_error": agent_error,
                                 "retry_status": retry_status,
                                 "activity": thread_activity_value(thread),
+                                "context": thread.token_usage().map(|usage| json!({
+                                    "used_tokens": usage.used_tokens,
+                                    "max_tokens": usage.max_tokens,
+                                })),
                             })
                         },
                     )
@@ -1195,6 +1319,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                 }),
             )
         }
+        "agent.limits" => agent_limits(&request, state, cx),
         "workspace.list" => workspaces::workspace_list(&request, state, cx),
         "workspace.open" => workspaces::workspace_open(&request, state, cx),
         "thread.open" => workspaces::thread_open(&request, state, cx),
@@ -5708,4 +5833,113 @@ fn success(request_id: &str, result: Value) -> Value {
 
 fn error(request_id: &str, code: &str) -> Value {
     json!({"version": 1, "request_id": request_id, "error": {"code": code}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(agent_id: &str, rate_limit_type: Option<&str>, observed_ms: u64) -> RateLimitRecord {
+        RateLimitRecord {
+            agent_id: agent_id.to_string(),
+            agent_name: "Claude Agent".to_string(),
+            thread_id: "thread-1".to_string(),
+            rate_limit: AgentRateLimit {
+                status: "allowed_warning".to_string(),
+                resets_at: Some(1795787661),
+                rate_limit_type: rate_limit_type.map(str::to_string),
+                utilization: Some(0.91),
+                surpassed_threshold: Some(0.9),
+                is_using_overage: Some(false),
+                observed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(observed_ms),
+            },
+        }
+    }
+
+    #[test]
+    fn rate_limit_values_follow_contract_shape_in_key_order() {
+        let mut records = HashMap::new();
+        records.insert(
+            ("claude-acp".to_string(), "seven_day".to_string()),
+            record("claude-acp", Some("seven_day"), 2000),
+        );
+        records.insert(
+            ("claude-acp".to_string(), "five_hour".to_string()),
+            record("claude-acp", Some("five_hour"), 1795780000000),
+        );
+        let values = rate_limit_values(&records);
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0],
+            json!({
+                "agent_id": "claude-acp",
+                "agent_name": "Claude Agent",
+                "thread_id": "thread-1",
+                "observed_at_ms": 1795780000000u64,
+                "rate_limit": {
+                    "status": "allowed_warning",
+                    "resets_at": 1795787661,
+                    "rate_limit_type": "five_hour",
+                    "utilization": 0.91,
+                    "surpassed_threshold": 0.9,
+                    "is_using_overage": false,
+                },
+            })
+        );
+        assert_eq!(
+            values[1]["rate_limit"]["rate_limit_type"],
+            json!("seven_day")
+        );
+    }
+
+    #[test]
+    fn turn_usage_value_follows_contract_shape() {
+        let usage = TurnUsage {
+            input_tokens: 500,
+            output_tokens: 200,
+            cache_read_tokens: Some(300),
+            cache_write_tokens: None,
+            thought_tokens: Some(40),
+        };
+        assert_eq!(
+            turn_usage_value(usage),
+            json!({
+                "input_tokens": 500,
+                "output_tokens": 200,
+                "cache_read_tokens": 300,
+                "cache_write_tokens": null,
+                "thought_tokens": 40,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_limits_is_always_allowed_and_advertised() {
+        let permissions = ProbePermissions {
+            expose_all_threads: false,
+            all_projects: false,
+            workspace_control: false,
+            session_creation: false,
+            attachments: false,
+            project_context: false,
+            git_changes: false,
+            approval_decisions: false,
+            agent_settings: false,
+            terminal_read: false,
+            terminal_input: false,
+            remote_clipboard: false,
+            task_control: false,
+            task_start: false,
+            debugger_read: false,
+            debugger_start: false,
+            debugger_control: false,
+        };
+        assert!(permissions.allows("agent.limits", &json!({})));
+        assert!(permissions.capabilities().contains(&"agent.limits"));
+        assert!(params_contain_only(&json!({}), &["instance_id", "epoch"]));
+        assert!(!params_contain_only(
+            &json!({"thread_id": "x"}),
+            &["instance_id", "epoch"]
+        ));
+    }
 }

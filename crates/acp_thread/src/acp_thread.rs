@@ -1,3 +1,4 @@
+mod agent_usage;
 pub mod auth_methods;
 pub mod commands;
 pub mod compaction;
@@ -16,6 +17,7 @@ pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::{schema::MaybeUndefined, v1::schema as acp_v1, v2::schema as acp_v2};
 use agent_settings::AgentSettings;
+pub use agent_usage::*;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashSet, IndexMap};
 pub use connection::*;
@@ -3770,6 +3772,8 @@ pub struct AcpThread {
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
+    rate_limit: Option<AgentRateLimit>,
+    last_turn_usage: Option<TurnUsage>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
@@ -4134,6 +4138,8 @@ impl AcpThread {
             connection,
             token_usage: None,
             cost: None,
+            rate_limit: None,
+            last_turn_usage: None,
             prompt_capabilities,
             available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
@@ -4614,6 +4620,15 @@ impl AcpThread {
         self.token_usage.as_ref()
     }
 
+    pub fn rate_limit(&self) -> Option<&AgentRateLimit> {
+        self.rate_limit.as_ref()
+    }
+
+    /// Usage of the turn whose `Stopped` event was emitted last, when the agent reported it.
+    pub fn last_turn_usage(&self) -> Option<TurnUsage> {
+        self.last_turn_usage
+    }
+
     pub fn submission(&self, id: SubmissionId) -> Option<&SubmissionRecord> {
         self.submissions.get(id)
     }
@@ -4887,6 +4902,7 @@ impl AcpThread {
         self.set_foreground_state(state, cx);
         if let Some(acp_v2::StateUpdate::Idle(idle)) = self.activity.state() {
             let stop_reason = idle.stop_reason.clone();
+            let turn_usage = idle.usage.as_deref().map(TurnUsage::from);
             if let Some(usage) = &idle.usage {
                 let reported = ReportedTokenUsage {
                     activity_generation: self.activity.generation(),
@@ -4922,6 +4938,7 @@ impl AcpThread {
                             | acp_v2::StopReason::Error(_)
                     )
                 );
+                self.last_turn_usage = turn_usage;
                 // Reported refusal does not authorize deleting agent-owned history.
                 cx.emit(AcpThreadEvent::Stopped {
                     activity_generation: self.activity.generation(),
@@ -6276,6 +6293,13 @@ impl AcpThread {
                     meta: cost.meta,
                 });
             }
+        }
+        if let Some(rate_limit) = update
+            .meta
+            .as_ref()
+            .and_then(|meta| AgentRateLimit::from_meta(meta, std::time::SystemTime::now()))
+        {
+            self.rate_limit = Some(rate_limit);
         }
         cx.emit(AcpThreadEvent::TokenUsageUpdated(
             OutputTokensUpdate::Unchanged,
@@ -7750,6 +7774,7 @@ impl AcpThread {
                             cx.emit(AcpThreadEvent::StatusChanged);
                         }
                         let stop_reason = stop_reason_from_v1(&r.stop_reason);
+                        this.last_turn_usage = r.usage.as_ref().map(TurnUsage::from);
                         this.set_foreground_state(
                             acp_v2::StateUpdate::Idle(
                                 acp_v2::IdleStateUpdate::new().stop_reason(stop_reason.clone()),
