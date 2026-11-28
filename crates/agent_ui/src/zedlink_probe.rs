@@ -753,20 +753,28 @@ struct RateLimitRecord {
 }
 
 fn record_thread_rate_limit(state: &ProbeState, thread: &Entity<AcpThread>, cx: &App) {
-    let Some(rate_limit) = thread.read(cx).rate_limit().cloned() else {
+    if thread.read(cx).rate_limits().is_empty() {
         return;
-    };
+    }
     let thread_id = thread.read(cx).session_id().to_string();
     let agent_id = thread.read(cx).connection().agent_id().to_string();
-    let key = (
-        agent_id.clone(),
-        rate_limit.rate_limit_type.clone().unwrap_or_default(),
-    );
     let mut rate_limits = state.rate_limits.borrow_mut();
-    if rate_limits
-        .get(&key)
-        .is_some_and(|record| record.rate_limit.observed_at >= rate_limit.observed_at)
-    {
+    let newer = thread
+        .read(cx)
+        .rate_limits()
+        .iter()
+        .filter(|rate_limit| {
+            let key = (
+                agent_id.clone(),
+                rate_limit.rate_limit_type.clone().unwrap_or_default(),
+            );
+            rate_limits
+                .get(&key)
+                .is_none_or(|record| record.rate_limit.observed_at < rate_limit.observed_at)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if newer.is_empty() {
         return;
     }
     let agent_name = loaded_thread_views(None, cx)
@@ -774,15 +782,20 @@ fn record_thread_rate_limit(state: &ProbeState, thread: &Entity<AcpThread>, cx: 
         .find(|(candidate, _)| candidate == thread)
         .map(|(_, view)| view.read(cx).agent_display_name.to_string())
         .unwrap_or_else(|| agent_id.clone());
-    rate_limits.insert(
-        key,
-        RateLimitRecord {
-            agent_id,
-            agent_name,
-            thread_id,
-            rate_limit,
-        },
-    );
+    for rate_limit in newer {
+        rate_limits.insert(
+            (
+                agent_id.clone(),
+                rate_limit.rate_limit_type.clone().unwrap_or_default(),
+            ),
+            RateLimitRecord {
+                agent_id: agent_id.clone(),
+                agent_name: agent_name.clone(),
+                thread_id: thread_id.clone(),
+                rate_limit,
+            },
+        );
+    }
 }
 
 fn agent_limits(request: &ProbeRequest, state: &ProbeState, cx: &App) -> Value {

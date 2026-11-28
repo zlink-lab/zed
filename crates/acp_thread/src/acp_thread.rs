@@ -3772,7 +3772,7 @@ pub struct AcpThread {
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
-    rate_limit: Option<AgentRateLimit>,
+    rate_limits: Vec<AgentRateLimit>,
     last_turn_usage: Option<TurnUsage>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
@@ -4138,7 +4138,7 @@ impl AcpThread {
             connection,
             token_usage: None,
             cost: None,
-            rate_limit: None,
+            rate_limits: Vec::new(),
             last_turn_usage: None,
             prompt_capabilities,
             available_commands: Vec::new(),
@@ -4620,8 +4620,8 @@ impl AcpThread {
         self.token_usage.as_ref()
     }
 
-    pub fn rate_limit(&self) -> Option<&AgentRateLimit> {
-        self.rate_limit.as_ref()
+    pub fn rate_limits(&self) -> &[AgentRateLimit] {
+        &self.rate_limits
     }
 
     /// Usage of the turn whose `Stopped` event was emitted last, when the agent reported it.
@@ -6294,12 +6294,12 @@ impl AcpThread {
                 });
             }
         }
-        if let Some(rate_limit) = update
-            .meta
-            .as_ref()
-            .and_then(|meta| AgentRateLimit::from_meta(meta, std::time::SystemTime::now()))
-        {
-            self.rate_limit = Some(rate_limit);
+        if let Some(meta) = update.meta.as_ref() {
+            for rate_limit in AgentRateLimit::from_meta(meta, std::time::SystemTime::now()) {
+                self.rate_limits
+                    .retain(|known| known.rate_limit_type != rate_limit.rate_limit_type);
+                self.rate_limits.push(rate_limit);
+            }
         }
         cx.emit(AcpThreadEvent::TokenUsageUpdated(
             OutputTokensUpdate::Unchanged,
